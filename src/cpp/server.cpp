@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef _WIN32
@@ -30,6 +32,7 @@
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -166,6 +169,86 @@ std::optional<std::string> getHeader(const HttpRequest &request,
   return it->second;
 }
 
+std::optional<std::string> extractBearerToken(const std::string &authorization) {
+  const std::string prefix = "Bearer ";
+  if (authorization.rfind(prefix, 0) != 0) {
+    return std::nullopt;
+  }
+
+  auto token = trimCopy(authorization.substr(prefix.size()));
+  if (token.empty()) {
+    return std::nullopt;
+  }
+
+  return token;
+}
+
+bool requestIsAuthorized(const HttpRequest &request, const ServerOptions &options) {
+  if (options.apiToken.empty()) {
+    return true;
+  }
+
+  if (auto authorization = getHeader(request, "authorization")) {
+    if (auto bearer = extractBearerToken(*authorization)) {
+      if (*bearer == options.apiToken) {
+        return true;
+      }
+    }
+  }
+
+  if (auto token = getHeader(request, "x-api-token")) {
+    if (trimCopy(*token) == options.apiToken) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool clientDisconnected(SocketHandle socketHandle) {
+  fd_set readSet;
+  FD_ZERO(&readSet);
+  FD_SET(socketHandle, &readSet);
+
+  timeval timeout{};
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 0;
+
+#ifdef _WIN32
+  int ready = select(0, &readSet, nullptr, nullptr, &timeout);
+#else
+  int ready = select(socketHandle + 1, &readSet, nullptr, nullptr, &timeout);
+#endif
+
+  if (ready <= 0 || !FD_ISSET(socketHandle, &readSet)) {
+    return false;
+  }
+
+  char probe = 0;
+#ifdef _WIN32
+  int received = recv(socketHandle, &probe, 1, MSG_PEEK);
+  if (received == 0) {
+    return true;
+  }
+  if (received < 0) {
+    int err = WSAGetLastError();
+    return (err != WSAEWOULDBLOCK) && (err != WSAEINTR);
+  }
+#else
+  ssize_t received = recv(socketHandle, &probe, 1, MSG_PEEK);
+  if (received == 0) {
+    return true;
+  }
+  if (received < 0) {
+    return (errno != EAGAIN) && (errno != EWOULDBLOCK) && (errno != EINTR);
+  }
+#endif
+
+  // The peer may have sent extra bytes on a keep-alive request. This server
+  // closes every response, so extra data is ignored but does not mean closed.
+  return false;
+}
+
 bool recvAppend(SocketHandle socketHandle, std::string &buffer) {
   char chunk[8192];
 #ifdef _WIN32
@@ -277,6 +360,8 @@ std::string reasonPhrase(int statusCode) {
     return "Created";
   case 400:
     return "Bad Request";
+  case 401:
+    return "Unauthorized";
   case 404:
     return "Not Found";
   case 405:
@@ -301,7 +386,7 @@ void sendResponse(SocketHandle socketHandle, int statusCode,
   response << "Content-Length: " << body.size() << "\r\n";
   response << "Connection: close\r\n";
   response << "Access-Control-Allow-Origin: *\r\n";
-  response << "Access-Control-Allow-Headers: Content-Type\r\n";
+  response << "Access-Control-Allow-Headers: Content-Type, Authorization, X-API-Token\r\n";
   response << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
   for (const auto &[key, value] : extraHeaders) {
     response << key << ": " << value << "\r\n";
@@ -330,6 +415,324 @@ json modelInfoToJson(const ModelInfo &modelInfo) {
               {"model_file", modelInfo.modelPath.string()},
               {"config_file", modelInfo.configPath.string()},
               {"has_config", modelInfo.hasConfig}};
+}
+
+
+std::string modelKey(const std::filesystem::path &modelPath) {
+  std::error_code ignored;
+  auto absolutePath = std::filesystem::absolute(modelPath, ignored);
+  if (ignored) {
+    return modelPath.lexically_normal().string();
+  }
+
+  auto canonicalPath = std::filesystem::weakly_canonical(absolutePath, ignored);
+  if (ignored) {
+    return absolutePath.lexically_normal().string();
+  }
+
+  return canonicalPath.string();
+}
+
+std::optional<ModelInfo> findModelByName(const ServerOptions &options,
+                                         const std::string &requestedModel) {
+  std::string modelName = trimCopy(requestedModel);
+  if (modelName.empty()) {
+    modelName = options.activeModelPath.filename().string();
+  }
+
+  if (!isSafeFileName(modelName)) {
+    throw std::runtime_error("invalid_model");
+  }
+
+  std::vector<std::string> candidates{modelName};
+  if (std::filesystem::path(modelName).extension().empty()) {
+    candidates.push_back(modelName + ".onnx");
+  }
+
+  for (const auto &candidate : candidates) {
+    if (candidate == options.activeModelPath.filename().string()) {
+      const auto configPath = options.activeModelConfigPath.empty()
+                                  ? std::filesystem::path(options.activeModelPath.string() + ".json")
+                                  : options.activeModelConfigPath;
+      return ModelInfo{candidate, options.activeModelPath, configPath,
+                       std::filesystem::exists(configPath)};
+    }
+  }
+
+  const auto models = scanModels(options.modelsDir);
+  for (const auto &candidate : candidates) {
+    for (const auto &model : models) {
+      if (model.name == candidate) {
+        return model;
+      }
+    }
+  }
+
+  return std::nullopt;
+}
+
+struct JobLimiter {
+  explicit JobLimiter(std::size_t maxJobs) : maxJobs(std::max<std::size_t>(1, maxJobs)) {}
+
+  bool tryAcquire() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (activeJobs >= maxJobs) {
+      return false;
+    }
+
+    ++activeJobs;
+    return true;
+  }
+
+  void release() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (activeJobs > 0) {
+      --activeJobs;
+    }
+  }
+
+  std::size_t active() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    return activeJobs;
+  }
+
+private:
+  const std::size_t maxJobs;
+  mutable std::mutex mutex;
+  std::size_t activeJobs = 0;
+};
+
+struct JobLease {
+  JobLimiter *limiter = nullptr;
+  bool owns = false;
+
+  JobLease() = default;
+  explicit JobLease(JobLimiter &jobLimiter) : limiter(&jobLimiter), owns(jobLimiter.tryAcquire()) {}
+  JobLease(const JobLease &) = delete;
+  JobLease &operator=(const JobLease &) = delete;
+
+  JobLease(JobLease &&other) noexcept : limiter(other.limiter), owns(other.owns) {
+    other.limiter = nullptr;
+    other.owns = false;
+  }
+
+  JobLease &operator=(JobLease &&other) noexcept {
+    if (this != &other) {
+      reset();
+      limiter = other.limiter;
+      owns = other.owns;
+      other.limiter = nullptr;
+      other.owns = false;
+    }
+    return *this;
+  }
+
+  ~JobLease() { reset(); }
+
+  explicit operator bool() const { return owns; }
+
+  void reset() {
+    if (owns && limiter != nullptr) {
+      limiter->release();
+    }
+    owns = false;
+    limiter = nullptr;
+  }
+};
+
+struct VoiceSlot {
+  std::unique_ptr<piper::Voice> ownedVoice;
+  piper::Voice *voice = nullptr;
+  bool inUse = false;
+};
+
+struct ModelRuntime {
+  explicit ModelRuntime(ModelInfo modelInfo) : info(std::move(modelInfo)) {}
+
+  ModelInfo info;
+  std::mutex mutex;
+  std::vector<std::unique_ptr<VoiceSlot>> slots;
+  std::size_t loadingSlots = 0;
+};
+
+struct VoiceLease {
+  std::shared_ptr<ModelRuntime> runtime;
+  VoiceSlot *slot = nullptr;
+
+  VoiceLease() = default;
+  VoiceLease(std::shared_ptr<ModelRuntime> modelRuntime, VoiceSlot *voiceSlot)
+      : runtime(std::move(modelRuntime)), slot(voiceSlot) {}
+  VoiceLease(const VoiceLease &) = delete;
+  VoiceLease &operator=(const VoiceLease &) = delete;
+
+  VoiceLease(VoiceLease &&other) noexcept
+      : runtime(std::move(other.runtime)), slot(other.slot) {
+    other.slot = nullptr;
+  }
+
+  VoiceLease &operator=(VoiceLease &&other) noexcept {
+    if (this != &other) {
+      reset();
+      runtime = std::move(other.runtime);
+      slot = other.slot;
+      other.slot = nullptr;
+    }
+    return *this;
+  }
+
+  ~VoiceLease() { reset(); }
+
+  piper::Voice &get() const { return *slot->voice; }
+  const ModelInfo &model() const { return runtime->info; }
+  explicit operator bool() const { return slot != nullptr && slot->voice != nullptr; }
+
+  void reset() {
+    if (runtime && slot != nullptr) {
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      slot->inUse = false;
+    }
+    slot = nullptr;
+    runtime.reset();
+  }
+};
+
+class ModelCache {
+public:
+  ModelCache(piper::PiperConfig &piperConfig, piper::Voice &defaultVoice,
+             const ServerOptions &options)
+      : piperConfig(piperConfig), options(options),
+        maxReplicas(std::max<std::size_t>(1, options.maxModelReplicas)) {
+    const auto activeName = options.activeModelPath.filename().string();
+    const auto activeConfig = options.activeModelConfigPath.empty()
+                                  ? std::filesystem::path(options.activeModelPath.string() + ".json")
+                                  : options.activeModelConfigPath;
+    auto runtime = std::make_shared<ModelRuntime>(
+        ModelInfo{activeName, options.activeModelPath, activeConfig,
+                  std::filesystem::exists(activeConfig)});
+
+    auto slot = std::make_unique<VoiceSlot>();
+    slot->voice = &defaultVoice;
+    runtime->slots.push_back(std::move(slot));
+
+    cache[modelKey(options.activeModelPath)] = runtime;
+  }
+
+  VoiceLease checkout(const std::optional<std::string> &requestedModel) {
+    auto info = resolve(requestedModel);
+    auto runtime = runtimeFor(info);
+
+    std::unique_lock<std::mutex> lock(runtime->mutex);
+    for (const auto &slot : runtime->slots) {
+      if (!slot->inUse) {
+        slot->inUse = true;
+        return VoiceLease(runtime, slot.get());
+      }
+    }
+
+    if ((runtime->slots.size() + runtime->loadingSlots) >= maxReplicas) {
+      throw std::runtime_error("model_busy");
+    }
+
+    ++runtime->loadingSlots;
+    auto newVoice = std::make_unique<piper::Voice>();
+    auto speakerId = options.defaultSpeakerId;
+    lock.unlock();
+
+    try {
+      spdlog::info("Loading model replica: {}", info.modelPath.string());
+      piper::loadVoice(piperConfig, info.modelPath.string(), info.configPath.string(),
+                       *newVoice, speakerId, options.useCuda, options.cpuThreads);
+    } catch (...) {
+      lock.lock();
+      if (runtime->loadingSlots > 0) {
+        --runtime->loadingSlots;
+      }
+      lock.unlock();
+      throw;
+    }
+
+    lock.lock();
+    if (runtime->loadingSlots > 0) {
+      --runtime->loadingSlots;
+    }
+    auto slot = std::make_unique<VoiceSlot>();
+    slot->voice = newVoice.get();
+    slot->ownedVoice = std::move(newVoice);
+    slot->inUse = true;
+    auto *slotPtr = slot.get();
+    runtime->slots.push_back(std::move(slot));
+    return VoiceLease(runtime, slotPtr);
+  }
+
+private:
+  ModelInfo resolve(const std::optional<std::string> &requestedModel) {
+    const auto modelName = requestedModel ? trimCopy(*requestedModel) : std::string();
+    auto info = findModelByName(options, modelName);
+    if (!info) {
+      throw std::runtime_error("model_not_found");
+    }
+
+    if (!info->hasConfig) {
+      throw std::runtime_error("model_config_missing");
+    }
+
+    return *info;
+  }
+
+  std::shared_ptr<ModelRuntime> runtimeFor(const ModelInfo &info) {
+    const auto key = modelKey(info.modelPath);
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      return it->second;
+    }
+
+    auto runtime = std::make_shared<ModelRuntime>(info);
+    cache[key] = runtime;
+    return runtime;
+  }
+
+  piper::PiperConfig &piperConfig;
+  const ServerOptions &options;
+  const std::size_t maxReplicas;
+  std::mutex cacheMutex;
+  std::map<std::string, std::shared_ptr<ModelRuntime>> cache;
+};
+
+int errorStatusForException(const std::string &error) {
+  if (error == "invalid_model") {
+    return 400;
+  }
+  if (error == "model_not_found" || error == "model_config_missing") {
+    return 404;
+  }
+  if (error == "model_busy" || error == "server_busy") {
+    return 429;
+  }
+  return 500;
+}
+
+json modelErrorResponse(const std::string &error) {
+  if (error == "invalid_model") {
+    return errorResponse("invalid_request",
+                         "El nombre del modelo es inválido. Usa solo el nombre del archivo .onnx dentro de models/.");
+  }
+  if (error == "model_not_found") {
+    return errorResponse("model_not_found", "Modelo no encontrado en la carpeta models/.");
+  }
+  if (error == "model_config_missing") {
+    return errorResponse("model_config_missing",
+                         "El modelo existe, pero falta su archivo .onnx.json.");
+  }
+  if (error == "model_busy") {
+    return errorResponse("server_busy",
+                         "Todas las réplicas de ese modelo están ocupadas. Intenta nuevamente.");
+  }
+  if (error == "server_busy") {
+    return errorResponse("server_busy",
+                         "El servidor alcanzó el límite de síntesis simultáneas. Intenta nuevamente.");
+  }
+  return errorResponse("server_error", error);
 }
 
 void sendFile(SocketHandle socketHandle, const std::filesystem::path &filePath) {
@@ -363,8 +766,8 @@ void sendFile(SocketHandle socketHandle, const std::filesystem::path &filePath) 
 }
 
 void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
-                  piper::Voice &voice, const ServerOptions &options,
-                  std::mutex &synthesisMutex) {
+                  const ServerOptions &options, ModelCache &modelCache,
+                  JobLimiter &jobLimiter) {
   try {
     auto maybeRequest = readHttpRequest(clientSocket, options.maxInputBytes);
     if (!maybeRequest) {
@@ -376,6 +779,14 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
 
     if (request.method == "OPTIONS") {
       sendResponse(clientSocket, 200, "text/plain; charset=utf-8", "");
+      closeSocket(clientSocket);
+      return;
+    }
+
+    if (!requestIsAuthorized(request, options)) {
+      sendJson(clientSocket, 401,
+               errorResponse("invalid_token",
+                             "Token inválido, ausente o expirado."));
       closeSocket(clientSocket);
       return;
     }
@@ -398,10 +809,18 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
                                     {"active_model", options.activeModelPath.string()},
                                     {"models_dir", options.modelsDir.string()},
                                     {"output_dir", options.outputDir.string()},
+                                    {"auth",
+                                     json{{"enabled", !options.apiToken.empty()},
+                                          {"header", "Authorization: Bearer <token>"}}},
                                     {"limits",
                                      json{{"max_input_bytes", options.maxInputBytes},
                                           {"max_text_chunk_bytes",
-                                           options.maxTextChunkBytes}}}}));
+                                           options.maxTextChunkBytes},
+                                          {"max_concurrent_jobs",
+                                           options.maxConcurrentJobs},
+                                          {"max_model_replicas",
+                                           options.maxModelReplicas},
+                                          {"active_jobs", jobLimiter.active()}}}}));
       closeSocket(clientSocket);
       return;
     }
@@ -480,42 +899,80 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         }
       }
 
-      if (!synthesisMutex.try_lock()) {
-        sendJson(clientSocket, 429,
-                 errorResponse("server_busy",
-                               "El servidor está procesando otra síntesis. Intenta nuevamente."));
+      std::optional<std::string> requestedModel;
+      if (input.contains("model")) {
+        if (!input["model"].is_string()) {
+          sendJson(clientSocket, 400,
+                   errorResponse("invalid_request", "El campo model debe ser string."));
+          closeSocket(clientSocket);
+          return;
+        }
+        requestedModel = input["model"].get<std::string>();
+      }
+
+      JobLease jobLease(jobLimiter);
+      if (!jobLease) {
+        sendJson(clientSocket, 429, modelErrorResponse("server_busy"));
         closeSocket(clientSocket);
         return;
       }
 
-      std::unique_lock<std::mutex> synthesisLock(synthesisMutex, std::adopt_lock);
-      const auto previousSpeakerId = voice.synthesisConfig.speakerId;
+      VoiceLease voiceLease;
+      try {
+        voiceLease = modelCache.checkout(requestedModel);
+      } catch (const std::runtime_error &e) {
+        const std::string message = e.what();
+        sendJson(clientSocket, errorStatusForException(message),
+                 modelErrorResponse(message));
+        closeSocket(clientSocket);
+        return;
+      }
+
+      auto &selectedVoice = voiceLease.get();
+      const auto previousSpeakerId = selectedVoice.synthesisConfig.speakerId;
       if (input.contains("speaker_id") && input["speaker_id"].is_number_integer()) {
-        voice.synthesisConfig.speakerId = input["speaker_id"].get<piper::SpeakerId>();
+        selectedVoice.synthesisConfig.speakerId = input["speaker_id"].get<piper::SpeakerId>();
       }
 
       std::filesystem::create_directories(options.outputDir);
       const auto outputPath = options.outputDir / fileName;
       piper::SynthesisResult result;
+      auto shouldCancel = [&clientSocket]() {
+        return clientDisconnected(clientSocket);
+      };
 
       try {
+        if (shouldCancel()) {
+          throw std::runtime_error("synthesis_cancelled");
+        }
+
         std::ofstream audioFile(outputPath, std::ios::binary);
         if (!audioFile.good()) {
           throw std::runtime_error("Could not open output file");
         }
 
-        piper::textToWavFile(piperConfig, voice, text, audioFile, result,
-                             options.maxTextChunkBytes);
+        piper::textToWavFile(piperConfig, selectedVoice, text, audioFile, result,
+                             options.maxTextChunkBytes, shouldCancel);
       } catch (const std::exception &e) {
-        voice.synthesisConfig.speakerId = previousSpeakerId;
+        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        const std::string message = e.what();
+        if (message == "synthesis_cancelled") {
+          spdlog::warn("TTS request cancelled because client disconnected");
+          std::error_code ignored;
+          std::filesystem::remove(outputPath, ignored);
+          closeSocket(clientSocket);
+          return;
+        }
+
+        std::error_code ignored;
+        std::filesystem::remove(outputPath, ignored);
         sendJson(clientSocket, 500,
                  errorResponse("synthesis_error", e.what()));
         closeSocket(clientSocket);
         return;
       }
 
-      voice.synthesisConfig.speakerId = previousSpeakerId;
-      synthesisLock.unlock();
+      selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
 
       std::uintmax_t bytes = 0;
       if (std::filesystem::exists(outputPath)) {
@@ -525,6 +982,8 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       sendJson(clientSocket, 201,
                successResponse("Audio generado exitosamente.",
                                json{{"file", fileName},
+                                    {"model", voiceLease.model().name},
+                                    {"model_file", voiceLease.model().modelPath.string()},
                                     {"path", outputPath.string()},
                                     {"url", "/api/v1/files/" + fileName},
                                     {"format", "wav"},
@@ -644,8 +1103,17 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
   spdlog::info("Models directory: {}", options.modelsDir.string());
   spdlog::info("Active model: {}", options.activeModelPath.string());
   spdlog::info("Output directory: {}", options.outputDir.string());
+  if (options.apiToken.empty()) {
+    spdlog::warn("API token is not configured; HTTP API is open on this bind address");
+  } else {
+    spdlog::info("API token authentication enabled");
+  }
+  spdlog::info("Concurrent jobs limit: {}", options.maxConcurrentJobs);
+  spdlog::info("Model replicas per model: {}", options.maxModelReplicas);
 
-  std::mutex synthesisMutex;
+  ModelCache modelCache(piperConfig, voice, options);
+  JobLimiter jobLimiter(options.maxConcurrentJobs);
+
   while (true) {
     sockaddr_in clientAddress{};
 #ifdef _WIN32
@@ -659,8 +1127,8 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
       continue;
     }
 
-    std::thread(handleClient, clientSocket, std::ref(piperConfig), std::ref(voice),
-                options, std::ref(synthesisMutex))
+    std::thread(handleClient, clientSocket, std::ref(piperConfig), options,
+                std::ref(modelCache), std::ref(jobLimiter))
         .detach();
   }
 

@@ -1,5 +1,7 @@
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -112,10 +114,14 @@ struct RunConfig {
   string serverHost = "127.0.0.1";
   int serverPort = 8080;
   filesystem::path modelsDir = filesystem::path("models");
+  optional<string> apiToken;
+  size_t maxConcurrentJobs = 2;
+  size_t maxModelReplicas = 2;
   bool outputDirExplicit = false;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
+optional<string> resolveApiToken(const optional<string> &explicitToken);
 void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
                    condition_variable &cvAudio, bool &audioReady,
                    bool &audioFinished);
@@ -273,8 +279,15 @@ int main(int argc, char *argv[]) {
         runConfig.outputDirExplicit ? runConfig.outputPath.value()
                                     : filesystem::path("outputs"));
     serverOptions.activeModelPath = filesystem::absolute(runConfig.modelPath);
+    serverOptions.activeModelConfigPath = filesystem::absolute(runConfig.modelConfigPath);
+    serverOptions.defaultSpeakerId = runConfig.speakerId;
+    serverOptions.useCuda = runConfig.useCuda;
+    serverOptions.cpuThreads = runConfig.cpuThreads;
     serverOptions.maxInputBytes = runConfig.maxInputBytes;
     serverOptions.maxTextChunkBytes = runConfig.maxTextChunkBytes;
+    serverOptions.maxConcurrentJobs = runConfig.maxConcurrentJobs;
+    serverOptions.maxModelReplicas = runConfig.maxModelReplicas;
+    serverOptions.apiToken = resolveApiToken(runConfig.apiToken).value_or("");
 
     piper_server::runServer(piperConfig, voice, serverOptions);
     piper::terminate(piperConfig);
@@ -468,6 +481,92 @@ int main(int argc, char *argv[]) {
 
 // ----------------------------------------------------------------------------
 
+string trimEnvValue(string value) {
+  auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
+  while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
+    value.erase(value.begin());
+  }
+  while (!value.empty() && isSpace(static_cast<unsigned char>(value.back()))) {
+    value.pop_back();
+  }
+
+  if (value.size() >= 2) {
+    const char first = value.front();
+    const char last = value.back();
+    if ((first == '"' && last == '"') || (first == '\'' && last == '\'')) {
+      value = value.substr(1, value.size() - 2);
+    }
+  }
+
+  return value;
+}
+
+optional<string> envValue(const string &key) {
+  const char *rawValue = std::getenv(key.c_str());
+  if (rawValue == nullptr) {
+    return nullopt;
+  }
+
+  auto value = trimEnvValue(rawValue);
+  if (value.empty()) {
+    return nullopt;
+  }
+
+  return value;
+}
+
+optional<string> dotenvValue(const filesystem::path &envPath,
+                             const vector<string> &keys) {
+  ifstream envFile(envPath.string());
+  if (!envFile.good()) {
+    return nullopt;
+  }
+
+  string line;
+  while (getline(envFile, line)) {
+    line = trimEnvValue(line);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+
+    const auto equals = line.find('=');
+    if (equals == string::npos) {
+      continue;
+    }
+
+    auto key = trimEnvValue(line.substr(0, equals));
+    auto value = trimEnvValue(line.substr(equals + 1));
+    if (!value.empty() && value[0] == '#') {
+      continue;
+    }
+
+    for (const auto &expectedKey : keys) {
+      if (key == expectedKey && !value.empty()) {
+        return value;
+      }
+    }
+  }
+
+  return nullopt;
+}
+
+optional<string> resolveApiToken(const optional<string> &explicitToken) {
+  if (explicitToken && !explicitToken->empty()) {
+    return explicitToken;
+  }
+
+  const vector<string> keys = {"PIPER_API_TOKEN", "PIPER_AUTH_TOKEN", "API_TOKEN"};
+  for (const auto &key : keys) {
+    if (auto value = envValue(key)) {
+      return value;
+    }
+  }
+
+  return dotenvValue(filesystem::path(".env"), keys);
+}
+
+// ----------------------------------------------------------------------------
+
 void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
                    condition_variable &cvAudio, bool &audioReady,
                    bool &audioFinished) {
@@ -549,6 +648,15 @@ void printUsage(char *argv[]) {
        << endl;
   cerr << "   --models                DIR   models directory for server mode "
           "(default: models/)"
+       << endl;
+  cerr << "   --api-token             TOKEN protect API server with bearer token"
+       << endl;
+  cerr << "                                env/.env: PIPER_API_TOKEN" << endl;
+  cerr << "   --max-concurrent-jobs   NUM   max simultaneous TTS jobs in API "
+          "mode (default: 2)"
+       << endl;
+  cerr << "   --max-model-replicas    NUM   max ONNX replicas per model for "
+          "parallel API jobs (default: 2)"
        << endl;
   cerr << "   --max-input-bytes       NUM   max API/direct input bytes "
           "(default: 10485760)"
@@ -666,6 +774,23 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "--models") {
       ensureArg(argc, argv, i);
       runConfig.modelsDir = filesystem::path(argv[++i]);
+    } else if (arg == "--api-token" || arg == "--api_token") {
+      ensureArg(argc, argv, i);
+      runConfig.apiToken = string(argv[++i]);
+    } else if (arg == "--max-concurrent-jobs" || arg == "--max_concurrent_jobs") {
+      ensureArg(argc, argv, i);
+      long maxJobs = stol(argv[++i]);
+      if (maxJobs < 1) {
+        throw runtime_error("--max-concurrent-jobs must be >= 1");
+      }
+      runConfig.maxConcurrentJobs = static_cast<size_t>(maxJobs);
+    } else if (arg == "--max-model-replicas" || arg == "--max_model_replicas") {
+      ensureArg(argc, argv, i);
+      long maxReplicas = stol(argv[++i]);
+      if (maxReplicas < 1) {
+        throw runtime_error("--max-model-replicas must be >= 1");
+      }
+      runConfig.maxModelReplicas = static_cast<size_t>(maxReplicas);
     } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
       ensureArg(argc, argv, i);
       runConfig.cpuThreads = stoi(argv[++i]);
@@ -711,6 +836,10 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     if (!inputFile.good()) {
       throw runtime_error("Input text file doesn't exist");
     }
+  }
+
+  if (runConfig.maxModelReplicas > runConfig.maxConcurrentJobs) {
+    runConfig.maxModelReplicas = runConfig.maxConcurrentJobs;
   }
 
   if (runConfig.serverMode) {

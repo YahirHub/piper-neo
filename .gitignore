@@ -20,3 +20,8 @@ htmlcov
 
 .venv/
 lightning_logs/
+
+# Local secrets
+.env
+.env.*
+!.env.example
