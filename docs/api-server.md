@@ -347,3 +347,58 @@ Los archivos se entregan como `audio/wav` binario. No se devuelve audio en base6
 | `server_busy` | 429 | Cola o trabajos simultáneos saturados. |
 | `temp_storage_full` | 507 | Se alcanzó `--max-temp-bytes`. |
 | `synthesis_error` | 500 | Error durante la síntesis. |
+
+## Piper Neo `.neo` model packages
+
+The server now accepts both classic Piper voices and Piper Neo packages in the same `models/` directory:
+
+```text
+models/
+├─ es_MX-Veritasium.onnx
+├─ es_MX-Veritasium.onnx.json
+└─ es_ARG-Elena.neo
+```
+
+A `.neo` package contains the ONNX model, metadata JSON and optional image in one binary file. Internal sections are compressed with zstd, which is lossless and does not reduce audio quality.
+
+### Listing models
+
+```bash
+curl http://127.0.0.1:8080/api/v1/models?include=metadata
+```
+
+Example item:
+
+```json
+{
+  "file": "es_ARG-Elena.neo",
+  "format": "neo",
+  "config_file": "embedded",
+  "has_config": true,
+  "config_valid": true,
+  "has_image": true,
+  "image_url": "/api/v1/models/es_ARG-Elena.neo/image",
+  "neo": {
+    "version": 1,
+    "model_compression": "zstd",
+    "model_bytes": 65000000,
+    "stored_model_bytes": 42000000
+  }
+}
+```
+
+### Using a `.neo` model in TTS
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"model":"es_ARG-Elena.neo","text":"Hola, ¿cómo estás?"}'
+```
+
+### Model image
+
+Images are not embedded in `/models` responses. Use:
+
+```bash
+curl http://127.0.0.1:8080/api/v1/models/es_ARG-Elena.neo/image --output voice.jpg
+```

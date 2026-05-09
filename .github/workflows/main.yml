@@ -44,9 +44,12 @@ jobs:
         arch: [x64]
     steps:
       - uses: actions/checkout@v4
+      - name: install zstd
+        run: |
+          vcpkg install zstd:${{ matrix.arch }}-windows
       - name: configure
         run: |
-          cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
+          cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
       - name: build
         run: |
           cmake --build build --config Release

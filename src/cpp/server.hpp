@@ -13,9 +13,11 @@ namespace piper_server {
 
 struct ModelInfo {
   std::string name;
+  std::string format = "onnx";
   std::filesystem::path modelPath;
   std::filesystem::path configPath;
   bool hasConfig = false;
+  bool isNeo = false;
 };
 
 struct ResourcePolicy {

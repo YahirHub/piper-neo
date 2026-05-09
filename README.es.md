@@ -188,3 +188,63 @@ python TTS/bin/resample.py \
 ## Proyecto original
 
 Development has moved: https://github.com/OHF-Voice/piper1-gpl
+
+## Paquetes de modelo Piper Neo (`.neo`)
+
+Piper Neo también soporta un nuevo formato de voz de un solo archivo: `.neo`.
+
+Un archivo `.neo` contiene:
+
+- el modelo ONNX
+- la metadata JSON compatible con Piper
+- información de modelcard
+- imagen/portada opcional
+- metadata de speakers e inferencia
+
+Las secciones internas se comprimen con zstd. Es compresión sin pérdida: los pesos del modelo se conservan, así que no se reduce la calidad de audio. El beneficio es menor peso para distribuir y menos errores porque el modelo y su configuración viajan juntos.
+
+El formato clásico sigue funcionando:
+
+```text
+voz.onnx
+voz.onnx.json
+```
+
+Una voz Piper Neo se puede usar directamente:
+
+```bash
+piper --model models/es_MX-Veritasium.neo --text "Hola desde Piper Neo" --output_file hola.wav
+```
+
+Exportar una voz clásica ONNX a `.neo`:
+
+```bash
+piper \
+  --model models/es_MX-Veritasium.onnx \
+  --config models/es_MX-Veritasium.onnx.json \
+  --export-neo models/es_MX-Veritasium.neo
+```
+
+Con imagen opcional:
+
+```bash
+piper \
+  --model models/es_MX-Veritasium.onnx \
+  --config models/es_MX-Veritasium.onnx.json \
+  --neo-image portada.jpg \
+  --export-neo models/es_MX-Veritasium.neo
+```
+
+En modo servidor, `models/` puede contener voces `.onnx` y paquetes `.neo`:
+
+```bash
+piper --server --models models
+```
+
+`GET /api/v1/models?include=metadata` devuelve ambos formatos sin exponer rutas absolutas internas. Las imágenes no se incrustan en el listado; se consultan por separado:
+
+```text
+GET /api/v1/models/{model}/image
+```
+
+El contexto técnico recuperable del proyecto está en `neo-docs/`.
