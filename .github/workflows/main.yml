@@ -99,6 +99,8 @@ jobs:
     needs:
       - build_windows
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -145,6 +147,7 @@ jobs:
         shell: bash
         run: |
           gh release create "${{ steps.release_meta.outputs.release_tag }}" release-upload/* \
+            --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
             --title "${{ steps.release_meta.outputs.release_title }}" \
             --notes-file release-notes.md \
