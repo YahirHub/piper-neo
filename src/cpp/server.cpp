@@ -378,6 +378,8 @@ std::string reasonPhrase(int statusCode) {
     return "Too Many Requests";
   case 500:
     return "Internal Server Error";
+  case 507:
+    return "Insufficient Storage";
   default:
     return "OK";
   }
@@ -536,8 +538,7 @@ bool modelJsonHasImage(const json &root) {
 json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode) {
   json out{{"file", modelInfo.name},
            {"name", modelInfo.name},
-           {"model_file", modelInfo.modelPath.string()},
-           {"config_file", modelInfo.configPath.string()},
+           {"config_file", modelInfo.configPath.filename().string()},
            {"available", std::filesystem::exists(modelInfo.modelPath)},
            {"has_config", modelInfo.hasConfig},
            {"config_valid", false}};
@@ -597,14 +598,9 @@ json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode)
     out["audio"] = audio;
   }
   if (root.contains("language") && root["language"].is_object()) {
-    // Preserve legacy top-level language string (from modelcard) when returning full metadata.
-    if (out.contains("language") && out["language"].is_string()) {
-      out["language_code"] = out["language"];
-    }
-
     json language = json::object();
     copyIfExists<std::string>(language, root["language"], "code");
-    out["language"] = language;
+    out["language_info"] = language;
   }
   if (root.contains("espeak") && root["espeak"].is_object()) {
     json espeak = json::object();
@@ -696,6 +692,60 @@ std::pair<std::string, std::string> parseDataImage(const std::string &dataUri) {
 
 
 
+class ModelRegistry {
+public:
+  explicit ModelRegistry(const ServerOptions &options)
+      : options(options), refreshSeconds(std::max<std::size_t>(1, options.modelsRefreshSeconds)) {}
+
+  json list(const std::string &includeMode) {
+    refreshIfNeeded();
+    std::lock_guard<std::mutex> lock(mutex);
+    json models = json::array();
+    for (const auto &model : cachedModels) {
+      models.push_back(modelInfoToJson(model, includeMode));
+    }
+    return models;
+  }
+
+  std::optional<ModelInfo> find(const std::string &modelName) {
+    refreshIfNeeded();
+    std::lock_guard<std::mutex> lock(mutex);
+    for (const auto &model : cachedModels) {
+      if (model.name == modelName) {
+        return model;
+      }
+    }
+    return std::nullopt;
+  }
+
+  void forceRefresh() {
+    std::lock_guard<std::mutex> lock(mutex);
+    refreshLocked();
+  }
+
+private:
+  void refreshIfNeeded() {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized || now >= nextRefresh) {
+      refreshLocked();
+    }
+  }
+
+  void refreshLocked() {
+    cachedModels = scanModels(options.modelsDir);
+    initialized = true;
+    nextRefresh = std::chrono::steady_clock::now() + std::chrono::seconds(refreshSeconds);
+  }
+
+  const ServerOptions &options;
+  const std::size_t refreshSeconds;
+  std::mutex mutex;
+  bool initialized = false;
+  std::chrono::steady_clock::time_point nextRefresh{};
+  std::vector<ModelInfo> cachedModels;
+};
+
 std::string modelKey(const std::filesystem::path &modelPath) {
   std::error_code ignored;
   auto absolutePath = std::filesystem::absolute(modelPath, ignored);
@@ -712,7 +762,8 @@ std::string modelKey(const std::filesystem::path &modelPath) {
 }
 
 std::optional<ModelInfo> findModelByName(const ServerOptions &options,
-                                         const std::string &requestedModel) {
+                                         const std::string &requestedModel,
+                                         ModelRegistry *registry = nullptr) {
   std::string modelName = trimCopy(requestedModel);
   if (modelName.empty()) {
     modelName = options.activeModelPath.filename().string();
@@ -737,8 +788,15 @@ std::optional<ModelInfo> findModelByName(const ServerOptions &options,
     }
   }
 
-  const auto models = scanModels(options.modelsDir);
   for (const auto &candidate : candidates) {
+    if (registry != nullptr) {
+      if (auto model = registry->find(candidate)) {
+        return model;
+      }
+      continue;
+    }
+
+    const auto models = scanModels(options.modelsDir);
     for (const auto &model : models) {
       if (model.name == candidate) {
         return model;
@@ -879,8 +937,8 @@ struct VoiceLease {
 class ModelCache {
 public:
   ModelCache(piper::PiperConfig &piperConfig, piper::Voice &defaultVoice,
-             const ServerOptions &options)
-      : piperConfig(piperConfig), options(options),
+             const ServerOptions &options, ModelRegistry &registry)
+      : piperConfig(piperConfig), options(options), registry(registry),
         maxReplicas(std::max<std::size_t>(1, options.maxModelReplicas)) {
     const auto activeName = options.activeModelPath.filename().string();
     const auto activeConfig = options.activeModelConfigPath.empty()
@@ -933,9 +991,14 @@ public:
     lock.unlock();
 
     try {
-      spdlog::info("Loading model replica: {}", info.modelPath.string());
+      const auto loadStart = std::chrono::steady_clock::now();
+      spdlog::info("{} Model load started: model={}", nowIso8601(), info.name);
       piper::loadVoice(piperConfig, info.modelPath.string(), info.configPath.string(),
                        *newVoice, speakerId, options.useCuda, options.cpuThreads);
+      const auto loadEnd = std::chrono::steady_clock::now();
+      spdlog::info("{} Model load finished: model={} duration_ms={}", nowIso8601(),
+                   info.name,
+                   std::chrono::duration_cast<std::chrono::milliseconds>(loadEnd - loadStart).count());
     } catch (...) {
       lock.lock();
       if (runtime->loadingSlots > 0) {
@@ -963,7 +1026,7 @@ public:
 private:
   ModelInfo resolve(const std::optional<std::string> &requestedModel) {
     const auto modelName = requestedModel ? trimCopy(*requestedModel) : std::string();
-    auto info = findModelByName(options, modelName);
+    auto info = findModelByName(options, modelName, &registry);
     if (!info) {
       throw std::runtime_error("model_not_found");
     }
@@ -990,6 +1053,7 @@ private:
 
   piper::PiperConfig &piperConfig;
   const ServerOptions &options;
+  ModelRegistry &registry;
   const std::size_t maxReplicas;
   std::mutex cacheMutex;
   std::map<std::string, std::shared_ptr<ModelRuntime>> cache;
@@ -1004,6 +1068,7 @@ struct ServerMetrics {
   std::atomic<std::uint64_t> completedChunks{0};
   std::atomic<std::uint64_t> failedChunks{0};
   std::atomic<std::uint64_t> processingChunks{0};
+  std::atomic<std::uint64_t> tempStorageBytes{0};
 };
 
 struct TtsJobResult {
@@ -1082,6 +1147,12 @@ public:
   }
 
   TtsJobResult synthesize(const TtsJobRequest &request) {
+    if (request.shouldCancel && request.shouldCancel()) {
+      metrics.cancelledJobs++;
+      throw std::runtime_error("synthesis_cancelled");
+    }
+
+    const auto jobStart = std::chrono::steady_clock::now();
     auto job = std::make_shared<JobState>();
     job->id = makeOutputFileName();
     if (job->id.size() > 4 && job->id.substr(job->id.size() - 4) == ".wav") {
@@ -1101,6 +1172,11 @@ public:
     if (job->textChunks.empty()) {
       throw std::runtime_error("missing_fields");
     }
+
+    spdlog::info("{} TTS job queued: id={} model={} input_bytes={} chunks={}",
+                 nowIso8601(), job->id,
+                 request.requestedModel.value_or("<default>"), request.text.size(),
+                 job->textChunks.size());
 
     std::filesystem::create_directories(job->tempDir);
 
@@ -1131,8 +1207,8 @@ public:
       while (!job->done) {
         if (request.shouldCancel && request.shouldCancel()) {
           job->cancelled = true;
-          if (job->startedChunks == 0) {
-            job->pendingChunks = 0;
+          job->pendingChunks = job->inFlightChunks;
+          if (job->pendingChunks == 0) {
             job->done = true;
             job->cv.notify_all();
           }
@@ -1179,6 +1255,13 @@ public:
     }
 
     assembleWav(*job);
+    const auto jobEnd = std::chrono::steady_clock::now();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(jobEnd - jobStart).count();
+    spdlog::info("{} TTS job finished: id={} model={} chunks={} audio_seconds={} infer_seconds={} duration_ms={} file={} bytes={}",
+                 nowIso8601(), job->id, job->modelName, job->textChunks.size(),
+                 job->synthesis.audioSeconds, job->synthesis.inferSeconds,
+                 elapsedMs, job->fileName,
+                 std::filesystem::exists(job->outputPath) ? std::filesystem::file_size(job->outputPath) : 0);
     cleanupJob(*job);
     metrics.completedJobs++;
 
@@ -1219,6 +1302,7 @@ private:
     std::vector<std::string> textChunks;
     std::vector<std::filesystem::path> chunkPaths;
     std::vector<std::uintmax_t> chunkBytes;
+    std::atomic<std::uint64_t> allocatedTempBytes{0};
     std::size_t nextChunk = 0;
     std::size_t pendingChunks = 0;
     std::size_t startedChunks = 0;
@@ -1330,7 +1414,15 @@ private:
         return job->shouldCancel ? job->shouldCancel() : false;
       };
 
+      if (shouldCancel()) {
+        throw std::runtime_error("synthesis_cancelled");
+      }
+
       VoiceLease voiceLease = modelCache.checkout(job->requestedModel);
+      if (shouldCancel()) {
+        throw std::runtime_error("synthesis_cancelled");
+      }
+
       auto &selectedVoice = voiceLease.get();
       const auto previousSpeakerId = selectedVoice.synthesisConfig.speakerId;
       if (job->speakerId) {
@@ -1338,6 +1430,11 @@ private:
       }
 
       const auto chunkPath = job->tempDir / ("chunk_" + std::to_string(index) + ".raw");
+      if (shouldCancel()) {
+        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        throw std::runtime_error("synthesis_cancelled");
+      }
+
       std::ofstream chunkFile(chunkPath, std::ios::binary);
       if (!chunkFile.good()) {
         selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
@@ -1354,6 +1451,12 @@ private:
         const std::size_t audioBytes = sizeof(int16_t) * audioBuffer.size();
         chunkFile.write(reinterpret_cast<const char *>(audioBuffer.data()), audioBytes);
         bytes += audioBytes;
+
+        const auto newTempTotal = metrics.tempStorageBytes.fetch_add(audioBytes) + audioBytes;
+        job->allocatedTempBytes.fetch_add(audioBytes);
+        if (options.maxTempBytes > 0 && newTempTotal > options.maxTempBytes) {
+          throw std::runtime_error("temp_storage_full");
+        }
       };
 
       try {
@@ -1447,7 +1550,17 @@ private:
     }
   }
 
-  void cleanupJob(const JobState &job) {
+  void cleanupJob(JobState &job) {
+    const auto allocated = job.allocatedTempBytes.exchange(0);
+    if (allocated > 0) {
+      const auto current = metrics.tempStorageBytes.load();
+      if (current >= allocated) {
+        metrics.tempStorageBytes.fetch_sub(allocated);
+      } else {
+        metrics.tempStorageBytes.store(0);
+      }
+    }
+
     std::error_code ignored;
     std::filesystem::remove_all(job.tempDir, ignored);
   }
@@ -1497,6 +1610,9 @@ json metricsJson(const ServerMetrics &metrics, const FairTtsScheduler &scheduler
                json{{"processing", metrics.processingChunks.load()},
                     {"completed", metrics.completedChunks.load()},
                     {"failed", metrics.failedChunks.load()}}},
+              {"storage", json{{"temp_bytes", metrics.tempStorageBytes.load()},
+                                  {"max_temp_bytes", options.maxTempBytes},
+                                  {"output_retention_seconds", options.outputRetentionSeconds}}},
               {"resources", resourcePolicyJson(options, scheduler)}};
 }
 
@@ -1510,6 +1626,9 @@ int errorStatusForException(const std::string &error) {
   }
   if (error == "model_busy" || error == "server_busy") {
     return 429;
+  }
+  if (error == "temp_storage_full") {
+    return 507;
   }
   return 500;
 }
@@ -1533,6 +1652,10 @@ json modelErrorResponse(const std::string &error) {
   if (error == "server_busy") {
     return errorResponse("server_busy",
                          "El servidor alcanzó el límite de síntesis simultáneas. Intenta nuevamente.");
+  }
+  if (error == "temp_storage_full") {
+    return errorResponse("temp_storage_full",
+                         "El servidor alcanzó el límite de almacenamiento temporal para síntesis.");
   }
   return errorResponse("server_error", error);
 }
@@ -1567,9 +1690,78 @@ void sendFile(SocketHandle socketHandle, const std::filesystem::path &filePath) 
   }
 }
 
+bool isManagedWavFile(const std::filesystem::directory_entry &entry) {
+  if (!entry.is_regular_file()) {
+    return false;
+  }
+  return lowerCopy(entry.path().extension().string()) == ".wav";
+}
+
+void cleanupTempDirectory(const ServerOptions &options) {
+  std::error_code ignored;
+  const auto tempDir = options.outputDir / "tmp";
+  if (std::filesystem::exists(tempDir, ignored)) {
+    std::filesystem::remove_all(tempDir, ignored);
+    spdlog::info("{} Temp cleanup completed: dir={}", nowIso8601(), tempDir.filename().string());
+  }
+  std::filesystem::create_directories(tempDir, ignored);
+}
+
+void cleanupExpiredOutputFiles(const ServerOptions &options) {
+  if (options.outputRetentionSeconds == 0) {
+    return;
+  }
+
+  std::error_code ignored;
+  if (!std::filesystem::exists(options.outputDir, ignored)) {
+    return;
+  }
+
+  const auto cutoff = std::filesystem::file_time_type::clock::now() -
+                      std::chrono::seconds(options.outputRetentionSeconds);
+  std::size_t removed = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(options.outputDir, ignored)) {
+    if (ignored || !isManagedWavFile(entry)) {
+      continue;
+    }
+
+    const auto modified = entry.last_write_time(ignored);
+    if (ignored) {
+      ignored.clear();
+      continue;
+    }
+
+    if (modified < cutoff) {
+      std::filesystem::remove(entry.path(), ignored);
+      if (!ignored) {
+        ++removed;
+      } else {
+        ignored.clear();
+      }
+    }
+  }
+
+  if (removed > 0) {
+    spdlog::info("{} Output retention cleanup: removed={} retention_seconds={}",
+                 nowIso8601(), removed, options.outputRetentionSeconds);
+  }
+}
+
+void startOutputCleanupThread(ServerOptions options) {
+  std::thread([options]() {
+    const auto sleepSeconds = std::max<std::size_t>(30,
+        std::min<std::size_t>(300, options.outputRetentionSeconds == 0 ? 300 : options.outputRetentionSeconds / 4));
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::seconds(sleepSeconds));
+      cleanupExpiredOutputFiles(options);
+    }
+  }).detach();
+}
+
 void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
                   const ServerOptions &options, ModelCache &modelCache,
-                  FairTtsScheduler &scheduler, ServerMetrics &metrics) {
+                  ModelRegistry &modelRegistry, FairTtsScheduler &scheduler,
+                  ServerMetrics &metrics) {
   try {
     auto maybeRequest = readHttpRequest(clientSocket, options.maxInputBytes);
     if (!maybeRequest) {
@@ -1607,17 +1799,20 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
     if ((request.method == "GET") && (target.path == "/api/v1/status")) {
       sendJson(clientSocket, 200,
                successResponse("Estado obtenido correctamente.",
-                               json{{"server", "piper"},
+                               json{{"server", "piper-neo"},
                                     {"model_loaded", true},
-                                    {"active_model", options.activeModelPath.string()},
-                                    {"models_dir", options.modelsDir.string()},
-                                    {"output_dir", options.outputDir.string()},
+                                    {"active_model", options.activeModelPath.filename().string()},
+                                    {"models_dir", options.modelsDir.filename().string()},
+                                    {"output_dir", options.outputDir.filename().string()},
                                     {"auth",
                                      json{{"enabled", !options.apiToken.empty()},
                                           {"header", "Authorization: Bearer <token>"}}},
                                     {"limits",
                                      json{{"max_input_bytes", options.maxInputBytes},
-                                          {"max_text_chunk_bytes", options.maxTextChunkBytes}}},
+                                          {"max_text_chunk_bytes", options.maxTextChunkBytes},
+                                          {"max_temp_bytes", options.maxTempBytes},
+                                          {"output_retention_seconds", options.outputRetentionSeconds},
+                                          {"models_refresh_seconds", options.modelsRefreshSeconds}}},
                                     {"resource_policy", resourcePolicyJson(options, scheduler)}}));
       closeSocket(clientSocket);
       return;
@@ -1641,14 +1836,13 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         return;
       }
 
-      json models = json::array();
-      for (const auto &model : scanModels(options.modelsDir)) {
-        models.push_back(modelInfoToJson(model, includeMode));
-      }
+      json models = modelRegistry.list(includeMode);
       sendJson(clientSocket, 200,
                successResponse("Modelos listados correctamente.",
                                json{{"total", models.size()},
                                     {"include", includeMode},
+                                    {"cached", true},
+                                    {"refresh_seconds", options.modelsRefreshSeconds},
                                     {"models", models}}));
       closeSocket(clientSocket);
       return;
@@ -1670,7 +1864,7 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       }
 
       try {
-        auto modelInfo = findModelByName(options, *imageModelName);
+        auto modelInfo = findModelByName(options, *imageModelName, &modelRegistry);
         if (!modelInfo || !modelInfo->hasConfig) {
           sendJson(clientSocket, 404,
                    errorResponse("not_found", "Modelo o configuración no encontrada."));
@@ -1749,18 +1943,15 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         return;
       }
 
-      std::string fileName = makeOutputFileName();
-      if (input.contains("output_file") && input["output_file"].is_string()) {
-        fileName = input["output_file"].get<std::string>();
-        if (!isSafeFileName(fileName) ||
-            std::filesystem::path(fileName).extension() != ".wav") {
-          sendJson(clientSocket, 400,
-                   errorResponse("invalid_request",
-                                 "output_file debe ser un nombre seguro con extensión .wav."));
-          closeSocket(clientSocket);
-          return;
-        }
+      if (input.contains("output_file") || input.contains("outputFile")) {
+        sendJson(clientSocket, 400,
+                 errorResponse("invalid_request",
+                               "output_file ya no está soportado. Piper Neo genera nombres seguros automáticamente."));
+        closeSocket(clientSocket);
+        return;
       }
+
+      std::string fileName = makeOutputFileName();
 
       std::optional<std::string> requestedModel;
       if (input.contains("model")) {
@@ -1799,8 +1990,6 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
                  successResponse("Audio generado exitosamente.",
                                  json{{"file", fileName},
                                       {"model", result.modelName},
-                                      {"model_file", result.modelPath.string()},
-                                      {"path", outputPath.string()},
                                       {"url", "/api/v1/files/" + fileName},
                                       {"format", "wav"},
                                       {"chunks", result.chunks},
@@ -1897,6 +2086,9 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
                ServerOptions options) {
   std::filesystem::create_directories(options.modelsDir);
   std::filesystem::create_directories(options.outputDir);
+  cleanupTempDirectory(options);
+  cleanupExpiredOutputFiles(options);
+  startOutputCleanupThread(options);
 
 #ifdef _WIN32
   WSADATA wsaData;
@@ -1964,7 +2156,9 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
                options.cpuProfile, options.cpuThreads.value_or(0), options.chunkWorkers,
                options.maxConcurrentJobs, options.queueSize, options.maxModelReplicas);
 
-  ModelCache modelCache(piperConfig, voice, options);
+  ModelRegistry modelRegistry(options);
+  modelRegistry.forceRefresh();
+  ModelCache modelCache(piperConfig, voice, options, modelRegistry);
   ServerMetrics metrics;
   FairTtsScheduler scheduler(piperConfig, modelCache, options, metrics);
 
@@ -1982,7 +2176,8 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
     }
 
     std::thread(handleClient, clientSocket, std::ref(piperConfig), options,
-                std::ref(modelCache), std::ref(scheduler), std::ref(metrics))
+                std::ref(modelCache), std::ref(modelRegistry),
+                std::ref(scheduler), std::ref(metrics))
         .detach();
   }
 

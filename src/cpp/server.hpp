@@ -50,6 +50,9 @@ struct ServerOptions {
   std::string cpuProfile = "balanced";
   ResourcePolicy resourcePolicy;
   std::string apiToken;
+  std::size_t maxTempBytes = 1024ULL * 1024ULL * 1024ULL;
+  std::size_t outputRetentionSeconds = 3600;
+  std::size_t modelsRefreshSeconds = 30;
 };
 
 std::vector<ModelInfo> scanModels(const std::filesystem::path &modelsDir);

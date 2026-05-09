@@ -77,7 +77,6 @@ curl -X POST http://127.0.0.1:8080/api/v1/tts \
   -d '{
     "model": "es_MX-Veritasium.onnx",
     "text": "Voy a generar voz con acentos: á é í ó ú ñ ¿Qué tal?",
-    "output_file": "demo.wav"
   }'
 ```
 
@@ -119,3 +118,8 @@ curl http://127.0.0.1:8080/api/v1/metrics
 - Para 8 hilos, suele ser mejor `--cpu-threads 2` con `--chunk-workers 3` o `4`.
 - Si sube mucho la RAM, baja `--max-model-replicas`.
 - Si sube mucho la CPU, baja `--chunk-workers` o usa `--cpu-profile eco`.
+
+
+## Retención de audios API
+
+En modo API, Piper Neo genera nombres seguros automáticamente y elimina los WAV después de `--output-retention-seconds` segundos. El valor por defecto es `3600` segundos. El parámetro JSON `output_file` no está soportado en `/api/v1/tts`.
