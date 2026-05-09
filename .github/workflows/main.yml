@@ -56,6 +56,18 @@ jobs:
       - name: install
         run: |
           cmake --install build
+      - name: copy vcpkg runtime dlls
+        shell: pwsh
+        run: |
+          $triplet = "${{ matrix.arch }}-windows"
+          $binDir = Join-Path $env:VCPKG_INSTALLATION_ROOT "installed/$triplet/bin"
+          if (Test-Path $binDir) {
+            Copy-Item "$binDir/*.dll" "_install/piper/" -ErrorAction SilentlyContinue
+          }
+      - name: smoke test packaged executable
+        shell: pwsh
+        run: |
+          .\_install\piper\piper.exe --help
       - name: package
         run: |
           cd _install

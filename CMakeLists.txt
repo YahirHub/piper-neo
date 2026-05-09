@@ -7,6 +7,15 @@ file(READ "${CMAKE_CURRENT_LIST_DIR}/VERSION" piper_version)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Prefer a self-contained Windows binary. Without this, Release artifacts can
+# depend on Visual C++ runtime DLLs that may be missing on end-user machines.
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW)
+endif()
+if(MSVC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 if(MSVC)
   # Force compiler to use UTF-8 for IPA constants
   add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")

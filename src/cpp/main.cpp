@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <vector>
 
-#ifdef _MSC_VER
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -144,7 +144,29 @@ void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
 
 // ----------------------------------------------------------------------------
 
+int piperMain(int argc, char *argv[]);
+
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  // Keep console output readable on Windows, including errors before parsing.
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
+#endif
+
+  try {
+    return piperMain(argc, argv);
+  } catch (const std::exception &error) {
+    std::cerr << "piper: error: " << error.what() << std::endl;
+    std::cerr << "Run with --help to see available options." << std::endl;
+    return EXIT_FAILURE;
+  } catch (...) {
+    std::cerr << "piper: error: unknown fatal error" << std::endl;
+    std::cerr << "Run with --help to see available options." << std::endl;
+    return EXIT_FAILURE;
+  }
+}
+
+int piperMain(int argc, char *argv[]) {
   spdlog::set_default_logger(spdlog::stderr_color_st("piper"));
 
   RunConfig runConfig;
@@ -786,6 +808,7 @@ void printUsage(char *argv[]) {
           "instead of plain text"
        << endl;
   cerr << "   --server                      start local HTTP API server" << endl;
+  cerr << "   --serve                       alias for --server" << endl;
   cerr << "   --host                  IP    server host (default: 127.0.0.1)"
        << endl;
   cerr << "   --port                  NUM   server port (default: 8080)"
@@ -932,7 +955,7 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
       runConfig.jsonInput = true;
     } else if (arg == "--use_cuda" || arg == "--use-cuda") {
       runConfig.useCuda = true;
-    } else if (arg == "--server") {
+    } else if (arg == "--server" || arg == "--serve") {
       runConfig.serverMode = true;
     } else if (arg == "--host") {
       ensureArg(argc, argv, i);
@@ -1079,6 +1102,14 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
   }
 
   if (runConfig.serverMode) {
+    // Be forgiving: many users naturally pass a models folder with --model.
+    // In server mode, a directory supplied to --model is treated as --models.
+    if (!runConfig.modelPath.empty() && filesystem::is_directory(runConfig.modelPath)) {
+      runConfig.modelsDir = runConfig.modelPath;
+      runConfig.modelPath.clear();
+      modelConfigPath.reset();
+    }
+
     filesystem::create_directories(runConfig.modelsDir);
 
     if (runConfig.modelPath.empty()) {
@@ -1090,8 +1121,10 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         }
       } else {
         throw runtime_error(
-            "No usable .onnx/.neo model found. The models directory was created; "
-            "copy a model and its .onnx.json config or a .neo package there, or pass --model.");
+            "No usable .onnx/.neo model found in models directory: " +
+            runConfig.modelsDir.string() +
+            ". Copy a .neo file or a .onnx file with its .onnx.json config, "
+            "or pass --models DIR / --model FILE.");
       }
     } else if (!filesystem::exists(runConfig.modelPath)) {
       auto modelInModelsDir = runConfig.modelsDir / runConfig.modelPath;
