@@ -74,3 +74,22 @@ cat texto_largo.txt | ./piper \
 
 5. **Pruebas de estrés**
    - Añadir tests que generen entradas de 100 KB, 1 MB y frases sin espacios para validar que la RAM permanezca estable.
+
+## Actualización: chunking inteligente y servidor API
+
+Se agregó un divisor de texto más inteligente para textos largos:
+
+- Prioriza mantener completas preguntas y exclamaciones españolas (`¿...?`, `¡...!`).
+- Corta por párrafos antes que por frases.
+- Corta por frases fuertes (`.`, `?`, `!`, `…`) antes que por comas o espacios.
+- Evita romper palabras cuando existe un espacio cercano.
+- Mantiene cortes seguros en frontera UTF-8 para no dañar acentos ni caracteres especiales.
+- Conserva un límite duro de protección cuando una frase o palabra es extremadamente grande.
+
+También se agregó modo servidor:
+
+```bash
+./piper --server --models models --host 127.0.0.1 --port 8080
+```
+
+Al iniciar, `models/` se crea si no existe. Si no se pasa `--model`, se carga el primer `.onnx` que tenga su `.onnx.json` correspondiente dentro de la carpeta de modelos.
