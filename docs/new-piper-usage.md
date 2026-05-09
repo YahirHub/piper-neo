@@ -123,3 +123,51 @@ curl http://127.0.0.1:8080/api/v1/metrics
 ## Retención de audios API
 
 En modo API, Piper Neo genera nombres seguros automáticamente y elimina los WAV después de `--output-retention-seconds` segundos. El valor por defecto es `3600` segundos. El parámetro JSON `output_file` no está soportado en `/api/v1/tts`.
+
+## Exportar y usar paquetes `.neo`
+
+Crear un paquete Piper Neo desde una voz clásica:
+
+```bash
+piper \
+  --model models/voz.onnx \
+  --config models/voz.onnx.json \
+  --export-neo models/voz.neo
+```
+
+Agregar imagen explícita:
+
+```bash
+piper \
+  --model models/voz.onnx \
+  --config models/voz.onnx.json \
+  --neo-image portada.jpg \
+  --export-neo models/voz.neo
+```
+
+Ajustar compresión zstd:
+
+```bash
+piper \
+  --model models/voz.onnx \
+  --config models/voz.onnx.json \
+  --neo-compression-level 15 \
+  --export-neo models/voz.neo
+```
+
+Usar el paquete directamente:
+
+```bash
+piper --model models/voz.neo --text "Hola mundo" --output_file salida.wav
+```
+
+Usarlo desde API:
+
+```json
+{
+  "model": "voz.neo",
+  "text": "Hola mundo"
+}
+```
+
+`.neo` usa compresión zstd sin pérdida. Reduce peso de distribución, pero no cambia los pesos internos del modelo ni sacrifica calidad.

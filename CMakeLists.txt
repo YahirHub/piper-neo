@@ -17,7 +17,7 @@ elseif(NOT APPLE)
   string(APPEND CMAKE_C_FLAGS " -Wall -Wextra")
 endif()
 
-add_executable(piper src/cpp/main.cpp src/cpp/piper.cpp src/cpp/server.cpp)
+add_executable(piper src/cpp/main.cpp src/cpp/piper.cpp src/cpp/server.cpp src/cpp/neo_model.cpp)
 add_executable(test_piper src/cpp/test.cpp src/cpp/piper.cpp)
 
 # NOTE: external project prefix are shortened because of path length restrictions on Windows
@@ -92,6 +92,32 @@ target_link_libraries(piper
 
 if(WIN32)
   target_link_libraries(piper ws2_32)
+endif()
+
+# ---- zstd for Piper Neo model packages ---
+
+find_package(zstd CONFIG QUIET)
+if(zstd_FOUND)
+  if(TARGET zstd::libzstd_static)
+    target_link_libraries(piper zstd::libzstd_static)
+  elseif(TARGET zstd::libzstd_shared)
+    target_link_libraries(piper zstd::libzstd_shared)
+  elseif(TARGET zstd::libzstd)
+    target_link_libraries(piper zstd::libzstd)
+  else()
+    message(FATAL_ERROR "zstd package was found, but no known zstd CMake target exists")
+  endif()
+  target_compile_definitions(piper PUBLIC PIPER_NEO_HAS_ZSTD=1)
+else()
+  find_path(ZSTD_INCLUDE_DIR zstd.h)
+  find_library(ZSTD_LIBRARY NAMES zstd libzstd)
+  if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+    target_include_directories(piper PUBLIC ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(piper ${ZSTD_LIBRARY})
+    target_compile_definitions(piper PUBLIC PIPER_NEO_HAS_ZSTD=1)
+  else()
+    message(WARNING "zstd was not found. Piper Neo .neo zstd import/export will compile but fail at runtime.")
+  endif()
 endif()
 
 target_link_directories(piper PUBLIC

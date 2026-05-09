@@ -46,6 +46,7 @@
 #include <spdlog/spdlog.h>
 
 #include "json.hpp"
+#include "neo_model.hpp"
 
 using json = nlohmann::json;
 
@@ -538,7 +539,8 @@ bool modelJsonHasImage(const json &root) {
 json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode) {
   json out{{"file", modelInfo.name},
            {"name", modelInfo.name},
-           {"config_file", modelInfo.configPath.filename().string()},
+           {"format", modelInfo.format},
+           {"config_file", modelInfo.isNeo ? "embedded" : modelInfo.configPath.filename().string()},
            {"available", std::filesystem::exists(modelInfo.modelPath)},
            {"has_config", modelInfo.hasConfig},
            {"config_valid", false}};
@@ -547,15 +549,33 @@ json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode)
     return out;
   }
 
-  std::string configError;
-  auto maybeRoot = tryLoadJsonFile(modelInfo.configPath, configError);
-  if (!maybeRoot) {
-    out["config_error"] = configError.empty() ? "invalid_json" : configError;
-    return out;
+  json root;
+  std::optional<piper_neo::NeoPackageInfo> neoInfo;
+  if (modelInfo.isNeo) {
+    try {
+      neoInfo = piper_neo::inspectPackage(modelInfo.modelPath);
+      root = neoInfo->metadata;
+    } catch (const std::exception &e) {
+      out["config_error"] = e.what();
+      return out;
+    }
+  } else {
+    std::string configError;
+    auto maybeRoot = tryLoadJsonFile(modelInfo.configPath, configError);
+    if (!maybeRoot) {
+      out["config_error"] = configError.empty() ? "invalid_json" : configError;
+      return out;
+    }
+    root = *maybeRoot;
   }
 
-  const auto &root = *maybeRoot;
   out["config_valid"] = true;
+  if (neoInfo) {
+    out["neo"] = json{{"version", neoInfo->version},
+                       {"model_compression", neoInfo->modelCompression},
+                       {"model_bytes", neoInfo->modelBytes},
+                       {"stored_model_bytes", neoInfo->storedModelBytes}};
+  }
 
   json modelcard = json::object();
   if (root.contains("modelcard") && root["modelcard"].is_object()) {
@@ -568,7 +588,7 @@ json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode)
     copyIfExists<std::string>(modelcard, card, "sha256");
   }
 
-  const bool hasImage = modelJsonHasImage(root);
+  const bool hasImage = neoInfo ? neoInfo->hasImage : modelJsonHasImage(root);
   out["has_image"] = hasImage;
   if (hasImage) {
     out["image_url"] = "/api/v1/models/" + modelInfo.name + "/image";
@@ -776,6 +796,7 @@ std::optional<ModelInfo> findModelByName(const ServerOptions &options,
   std::vector<std::string> candidates{modelName};
   if (std::filesystem::path(modelName).extension().empty()) {
     candidates.push_back(modelName + ".onnx");
+    candidates.push_back(modelName + ".neo");
   }
 
   for (const auto &candidate : candidates) {
@@ -783,8 +804,10 @@ std::optional<ModelInfo> findModelByName(const ServerOptions &options,
       const auto configPath = options.activeModelConfigPath.empty()
                                   ? std::filesystem::path(options.activeModelPath.string() + ".json")
                                   : options.activeModelConfigPath;
-      return ModelInfo{candidate, options.activeModelPath, configPath,
-                       std::filesystem::exists(configPath)};
+      return ModelInfo{candidate, piper_neo::isNeoFile(options.activeModelPath) ? "neo" : "onnx",
+                       options.activeModelPath, configPath,
+                       piper_neo::isNeoFile(options.activeModelPath) || std::filesystem::exists(configPath),
+                       piper_neo::isNeoFile(options.activeModelPath)};
     }
   }
 
@@ -944,9 +967,10 @@ public:
     const auto activeConfig = options.activeModelConfigPath.empty()
                                   ? std::filesystem::path(options.activeModelPath.string() + ".json")
                                   : options.activeModelConfigPath;
+    const bool activeIsNeo = piper_neo::isNeoFile(options.activeModelPath);
     auto runtime = std::make_shared<ModelRuntime>(
-        ModelInfo{activeName, options.activeModelPath, activeConfig,
-                  std::filesystem::exists(activeConfig)});
+        ModelInfo{activeName, activeIsNeo ? "neo" : "onnx", options.activeModelPath, activeConfig,
+                  activeIsNeo || std::filesystem::exists(activeConfig), activeIsNeo});
 
     auto slot = std::make_unique<VoiceSlot>();
     slot->voice = &defaultVoice;
@@ -992,12 +1016,19 @@ public:
 
     try {
       const auto loadStart = std::chrono::steady_clock::now();
-      spdlog::info("{} Model load started: model={}", nowIso8601(), info.name);
-      piper::loadVoice(piperConfig, info.modelPath.string(), info.configPath.string(),
+      spdlog::info("{} Model load started: model={} format={}", nowIso8601(), info.name, info.format);
+      auto loadModelPath = info.modelPath;
+      auto loadConfigPath = info.configPath;
+      if (info.isNeo) {
+        auto extracted = piper_neo::extractPackage(info.modelPath, options.outputDir / "neo-cache");
+        loadModelPath = extracted.modelPath;
+        loadConfigPath = extracted.configPath;
+      }
+      piper::loadVoice(piperConfig, loadModelPath.string(), loadConfigPath.string(),
                        *newVoice, speakerId, options.useCuda, options.cpuThreads);
       const auto loadEnd = std::chrono::steady_clock::now();
-      spdlog::info("{} Model load finished: model={} duration_ms={}", nowIso8601(),
-                   info.name,
+      spdlog::info("{} Model load finished: model={} format={} duration_ms={}", nowIso8601(),
+                   info.name, info.format,
                    std::chrono::duration_cast<std::chrono::milliseconds>(loadEnd - loadStart).count());
     } catch (...) {
       lock.lock();
@@ -1636,7 +1667,7 @@ int errorStatusForException(const std::string &error) {
 json modelErrorResponse(const std::string &error) {
   if (error == "invalid_model") {
     return errorResponse("invalid_request",
-                         "El nombre del modelo es inválido. Usa solo el nombre del archivo .onnx dentro de models/.");
+                         "El nombre del modelo es inválido. Usa solo el nombre del archivo .onnx o .neo dentro de models/.");
   }
   if (error == "model_not_found") {
     return errorResponse("model_not_found", "Modelo no encontrado en la carpeta models/.");
@@ -1871,14 +1902,24 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
           closeSocket(clientSocket);
           return;
         }
-        auto root = loadJsonFile(modelInfo->configPath);
-        if (!modelJsonHasImage(root)) {
-          sendJson(clientSocket, 404,
-                   errorResponse("not_found", "El modelo no tiene imagen."));
-          closeSocket(clientSocket);
-          return;
+        std::string contentType;
+        std::string imageBytes;
+        if (modelInfo->isNeo) {
+          auto neoImage = piper_neo::readImageSection(modelInfo->modelPath);
+          contentType = neoImage.first;
+          imageBytes = neoImage.second;
+        } else {
+          auto root = loadJsonFile(modelInfo->configPath);
+          if (!modelJsonHasImage(root)) {
+            sendJson(clientSocket, 404,
+                     errorResponse("not_found", "El modelo no tiene imagen."));
+            closeSocket(clientSocket);
+            return;
+          }
+          auto parsedImage = parseDataImage(root["modelcard"]["image"].get<std::string>());
+          contentType = parsedImage.first;
+          imageBytes = parsedImage.second;
         }
-        auto [contentType, imageBytes] = parseDataImage(root["modelcard"]["image"].get<std::string>());
         sendResponse(clientSocket, 200, contentType, imageBytes,
                      {{"Cache-Control", "public, max-age=3600"}});
       } catch (const std::runtime_error &e) {
@@ -2056,13 +2097,14 @@ std::vector<ModelInfo> scanModels(const std::filesystem::path &modelsDir) {
     }
 
     auto path = entry.path();
-    if (path.extension() != ".onnx") {
-      continue;
+    const auto ext = lowerCopy(path.extension().string());
+    if (ext == ".onnx") {
+      auto configPath = std::filesystem::path(path.string() + ".json");
+      models.push_back(ModelInfo{path.filename().string(), "onnx", path, configPath,
+                                 std::filesystem::exists(configPath), false});
+    } else if (ext == ".neo") {
+      models.push_back(ModelInfo{path.filename().string(), "neo", path, {}, true, true});
     }
-
-    auto configPath = std::filesystem::path(path.string() + ".json");
-    models.push_back(ModelInfo{path.filename().string(), path, configPath,
-                               std::filesystem::exists(configPath)});
   }
 
   std::sort(models.begin(), models.end(), [](const ModelInfo &a, const ModelInfo &b) {

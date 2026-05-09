@@ -38,6 +38,7 @@
 #include "json.hpp"
 #include "piper.hpp"
 #include "server.hpp"
+#include "neo_model.hpp"
 
 using namespace std;
 using json = nlohmann::json;
@@ -127,6 +128,11 @@ struct RunConfig {
   size_t modelsRefreshSeconds = 30;
   string cpuProfile = "balanced";
   bool outputDirExplicit = false;
+
+  // Piper Neo package export (.neo)
+  optional<filesystem::path> exportNeoPath;
+  optional<filesystem::path> neoImagePath;
+  int neoCompressionLevel = 10;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
@@ -144,6 +150,19 @@ int main(int argc, char *argv[]) {
   RunConfig runConfig;
   parseArgs(argc, argv, runConfig);
 
+  if (runConfig.exportNeoPath) {
+    const auto start = chrono::steady_clock::now();
+    spdlog::info("Exporting Piper Neo package: output={} compression=zstd level={}",
+                 runConfig.exportNeoPath->string(), runConfig.neoCompressionLevel);
+    piper_neo::writePackageFromOnnx(runConfig.modelPath, runConfig.modelConfigPath,
+                                    *runConfig.exportNeoPath, runConfig.neoImagePath,
+                                    runConfig.neoCompressionLevel);
+    const auto end = chrono::steady_clock::now();
+    spdlog::info("Piper Neo package exported in {} ms",
+                 chrono::duration_cast<chrono::milliseconds>(end - start).count());
+    return EXIT_SUCCESS;
+  }
+
 #ifdef _WIN32
   // Required on Windows to preserve UTF-8 text, IPA symbols and Spanish accents.
   SetConsoleOutputCP(CP_UTF8);
@@ -153,9 +172,20 @@ int main(int argc, char *argv[]) {
   piper::PiperConfig piperConfig;
   piper::Voice voice;
 
+  filesystem::path loadModelPath = runConfig.modelPath;
+  filesystem::path loadConfigPath = runConfig.modelConfigPath;
+  optional<piper_neo::ExtractedNeoModel> extractedNeoModel;
+  if (piper_neo::isNeoFile(runConfig.modelPath)) {
+    extractedNeoModel = piper_neo::extractPackage(
+        runConfig.modelPath,
+        filesystem::temp_directory_path() / "piper-neo-cli-cache");
+    loadModelPath = extractedNeoModel->modelPath;
+    loadConfigPath = extractedNeoModel->configPath;
+  }
+
   spdlog::debug("Loading voice from {} (config={})",
-                runConfig.modelPath.string(),
-                runConfig.modelConfigPath.string());
+                loadModelPath.string(),
+                loadConfigPath.string());
 
   const auto loadWallTime = chrono::system_clock::now();
   const auto loadWallT = chrono::system_clock::to_time_t(loadWallTime);
@@ -167,16 +197,18 @@ int main(int argc, char *argv[]) {
 #endif
   std::ostringstream loadTimestamp;
   loadTimestamp << std::put_time(&loadWallTm, "%Y-%m-%dT%H:%M:%SZ");
-  spdlog::info("{} Model load started: model={}", loadTimestamp.str(),
-               runConfig.modelPath.filename().string());
+  spdlog::info("{} Model load started: model={} format={}", loadTimestamp.str(),
+               runConfig.modelPath.filename().string(),
+               piper_neo::isNeoFile(runConfig.modelPath) ? "neo" : "onnx");
 
   auto startTime = chrono::steady_clock::now();
-  loadVoice(piperConfig, runConfig.modelPath.string(),
-            runConfig.modelConfigPath.string(), voice, runConfig.speakerId,
+  loadVoice(piperConfig, loadModelPath.string(),
+            loadConfigPath.string(), voice, runConfig.speakerId,
             runConfig.useCuda, runConfig.cpuThreads);
   auto endTime = chrono::steady_clock::now();
-  spdlog::info("{} Model load finished: model={} duration_ms={}",
+  spdlog::info("{} Model load finished: model={} format={} duration_ms={}",
                loadTimestamp.str(), runConfig.modelPath.filename().string(),
+               piper_neo::isNeoFile(runConfig.modelPath) ? "neo" : "onnx",
                chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count());
 
   // Get the path to the piper executable so we can locate espeak-ng-data, etc.
@@ -303,7 +335,9 @@ int main(int argc, char *argv[]) {
         runConfig.outputDirExplicit ? runConfig.outputPath.value()
                                     : filesystem::path("outputs"));
     serverOptions.activeModelPath = filesystem::absolute(runConfig.modelPath);
-    serverOptions.activeModelConfigPath = filesystem::absolute(runConfig.modelConfigPath);
+    serverOptions.activeModelConfigPath = runConfig.modelConfigPath.empty()
+                                            ? filesystem::path()
+                                            : filesystem::absolute(runConfig.modelConfigPath);
     serverOptions.defaultSpeakerId = runConfig.speakerId;
     serverOptions.useCuda = runConfig.useCuda;
     serverOptions.cpuThreads = runConfig.cpuThreads;
@@ -789,6 +823,13 @@ void printUsage(char *argv[]) {
   cerr << "   --models-refresh-seconds NUM seconds to cache /models metadata "
           "(default: 30)"
        << endl;
+  cerr << "   --export-neo            FILE export --model/--config into a Piper Neo .neo package"
+       << endl;
+  cerr << "   --neo-image             FILE optional cover image for --export-neo"
+       << endl;
+  cerr << "   --neo-compression-level NUM  zstd compression level for .neo export "
+          "(default: 10)"
+       << endl;
   cerr << "   --max-input-bytes       NUM   max API/direct input bytes "
           "(default: 10485760)"
        << endl;
@@ -971,6 +1012,19 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         throw runtime_error("--models-refresh-seconds must be >= 1");
       }
       runConfig.modelsRefreshSeconds = static_cast<size_t>(refreshSeconds);
+    } else if (arg == "--export-neo" || arg == "--export_neo") {
+      ensureArg(argc, argv, i);
+      runConfig.exportNeoPath = filesystem::path(argv[++i]);
+    } else if (arg == "--neo-image" || arg == "--neo_image") {
+      ensureArg(argc, argv, i);
+      runConfig.neoImagePath = filesystem::path(argv[++i]);
+    } else if (arg == "--neo-compression-level" || arg == "--neo_compression_level") {
+      ensureArg(argc, argv, i);
+      int level = stoi(argv[++i]);
+      if (level < 1 || level > 22) {
+        throw runtime_error("--neo-compression-level must be between 1 and 22");
+      }
+      runConfig.neoCompressionLevel = level;
     } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
       ensureArg(argc, argv, i);
       string cpuThreadsArg = argv[++i];
@@ -1031,13 +1085,13 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
       auto maybeModel = piper_server::findFirstUsableModel(runConfig.modelsDir);
       if (maybeModel) {
         runConfig.modelPath = maybeModel->modelPath;
-        if (!modelConfigPath) {
+        if (!modelConfigPath && !maybeModel->isNeo) {
           modelConfigPath = maybeModel->configPath;
         }
       } else {
         throw runtime_error(
-            "No usable .onnx model found. The models directory was created; "
-            "copy a model and its .onnx.json config there or pass --model.");
+            "No usable .onnx/.neo model found. The models directory was created; "
+            "copy a model and its .onnx.json config or a .neo package there, or pass --model.");
       }
     } else if (!filesystem::exists(runConfig.modelPath)) {
       auto modelInModelsDir = runConfig.modelsDir / runConfig.modelPath;
@@ -1061,16 +1115,24 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     throw runtime_error("Model file doesn't exist");
   }
 
-  if (!modelConfigPath) {
+  if (piper_neo::isNeoFile(runConfig.modelPath)) {
+    runConfig.modelConfigPath.clear();
+  } else if (!modelConfigPath) {
     runConfig.modelConfigPath =
         filesystem::path(runConfig.modelPath.string() + ".json");
   } else {
     runConfig.modelConfigPath = modelConfigPath.value();
   }
 
-  // Verify model config exists
-  ifstream modelConfigFile(runConfig.modelConfigPath.c_str());
-  if (!modelConfigFile.good()) {
-    throw runtime_error("Model config doesn't exist");
+  // Verify model config exists for the classic .onnx format. .neo embeds it.
+  if (!piper_neo::isNeoFile(runConfig.modelPath)) {
+    ifstream modelConfigFile(runConfig.modelConfigPath.c_str());
+    if (!modelConfigFile.good()) {
+      throw runtime_error("Model config doesn't exist");
+    }
+  }
+
+  if (runConfig.exportNeoPath && piper_neo::isNeoFile(runConfig.modelPath)) {
+    throw runtime_error("--export-neo expects a classic .onnx model plus .onnx.json config");
   }
 }
