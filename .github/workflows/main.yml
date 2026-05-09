@@ -12,25 +12,28 @@ permissions:
   contents: write
 
 jobs:
-  build_linux:
-    name: "linux build"
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - name: build
-        run: |
-          docker buildx build . --platform linux/amd64,linux/arm64,linux/arm/v7 --output 'type=local,dest=dist'
-      - name: upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: piper-linux
-          path: |
-            dist/linux_amd64/piper_amd64.tar.gz
-            dist/linux_arm64/piper_arm64.tar.gz
-            dist/linux_arm_v7/piper_armv7.tar.gz
-          if-no-files-found: error
+  # Builds desactivados temporalmente.
+  # Se dejan comentados para reactivarlos cuando se necesiten binarios Linux/macOS.
+  #
+  # build_linux:
+  #   name: "linux build"
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: docker/setup-qemu-action@v3
+  #     - uses: docker/setup-buildx-action@v3
+  #     - name: build
+  #       run: |
+  #         docker buildx build . --platform linux/amd64,linux/arm64,linux/arm/v7 --output 'type=local,dest=dist'
+  #     - name: upload artifacts
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: piper-linux
+  #         path: |
+  #           dist/linux_amd64/piper_amd64.tar.gz
+  #           dist/linux_arm64/piper_arm64.tar.gz
+  #           dist/linux_arm_v7/piper_armv7.tar.gz
+  #         if-no-files-found: error
 
   build_windows:
     runs-on: windows-latest
@@ -61,43 +64,40 @@ jobs:
           path: _install/piper_windows_amd64.zip
           if-no-files-found: error
 
-  build_macos:
-    name: "macos build: ${{ matrix.arch }}"
-    runs-on: macos-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        arch: [x64, aarch64]
-    steps:
-      - uses: actions/checkout@v4
-      - name: configure
-        run: |
-          cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
-      - name: build
-        run: |
-          cmake --build build --config Release
-      - name: install
-        run: |
-          cmake --install build
-      - name: package
-        run: |
-          cd _install
-          tar -czf piper_macos_${{ matrix.arch }}.tar.gz piper/
-      - name: upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: piper-macos-${{ matrix.arch }}
-          path: _install/piper_macos_${{ matrix.arch }}.tar.gz
-          if-no-files-found: error
+  # build_macos:
+  #   name: "macos build: ${{ matrix.arch }}"
+  #   runs-on: macos-latest
+  #   strategy:
+  #     fail-fast: true
+  #     matrix:
+  #       arch: [x64, aarch64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: configure
+  #       run: |
+  #         cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
+  #     - name: build
+  #       run: |
+  #         cmake --build build --config Release
+  #     - name: install
+  #       run: |
+  #         cmake --install build
+  #     - name: package
+  #       run: |
+  #         cd _install
+  #         tar -czf piper_macos_${{ matrix.arch }}.tar.gz piper/
+  #     - name: upload artifacts
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: piper-macos-${{ matrix.arch }}
+  #         path: _install/piper_macos_${{ matrix.arch }}.tar.gz
+  #         if-no-files-found: error
 
   release:
     name: Create release
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     needs:
-      - build_linux
       - build_windows
-      - build_macos
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -106,14 +106,46 @@ jobs:
       - name: Normalize asset names
         run: |
           mkdir -p release-upload
-          cp release-assets/piper-linux/linux_amd64/piper_amd64.tar.gz release-upload/piper_linux_x86_64.tar.gz
-          cp release-assets/piper-linux/linux_arm64/piper_arm64.tar.gz release-upload/piper_linux_aarch64.tar.gz
-          cp release-assets/piper-linux/linux_arm_v7/piper_armv7.tar.gz release-upload/piper_linux_armv7l.tar.gz
           cp release-assets/piper-windows-amd64/piper_windows_amd64.zip release-upload/piper_windows_amd64.zip
-          cp release-assets/piper-macos-x64/piper_macos_x64.tar.gz release-upload/piper_macos_x64.tar.gz
-          cp release-assets/piper-macos-aarch64/piper_macos_aarch64.tar.gz release-upload/piper_macos_aarch64.tar.gz
+      - name: Prepare release metadata
+        id: release_meta
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::7}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+            release_title="${GITHUB_REF_NAME}"
+            release_flags="--latest"
+            release_notes="Release ${GITHUB_REF_NAME}"
+          else
+            release_tag="master-${GITHUB_RUN_NUMBER}-${short_sha}"
+            release_title="Build master #${GITHUB_RUN_NUMBER} (${short_sha})"
+            release_flags="--prerelease --latest=false"
+            release_notes="Build automático desde master.\n\nCommit: ${GITHUB_SHA}\nRun: ${GITHUB_RUN_NUMBER}\nPlataforma: Windows amd64"
+          fi
+
+          {
+            echo "release_tag=${release_tag}"
+            echo "release_title=${release_title}"
+            echo "release_flags=${release_flags}"
+            echo "release_notes<<EOF"
+            echo -e "${release_notes}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Write release notes
+        shell: bash
+        run: |
+          cat > release-notes.md <<'EOF'
+          ${{ steps.release_meta.outputs.release_notes }}
+          EOF
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" release-upload/* --title "${GITHUB_REF_NAME}" --notes "Release ${GITHUB_REF_NAME}"
+          gh release create "${{ steps.release_meta.outputs.release_tag }}" release-upload/* \
+            --target "${GITHUB_SHA}" \
+            --title "${{ steps.release_meta.outputs.release_title }}" \
+            --notes-file release-notes.md \
+            ${{ steps.release_meta.outputs.release_flags }}
