@@ -5,6 +5,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +34,7 @@
 
 #include "json.hpp"
 #include "piper.hpp"
+#include "server.hpp"
 
 using namespace std;
 using json = nlohmann::json;
@@ -93,9 +95,24 @@ struct RunConfig {
   // 0 or nullopt lets ONNX Runtime choose its default thread count.
   optional<int> cpuThreads;
 
-  // Maximum text chunk size before phonemization/synthesis.
-  // Long inputs are split so the full WAV is not kept in memory.
+  // Maximum preferred text chunk size before phonemization/synthesis.
+  // Long inputs are split intelligently so words/questions are preserved when
+  // possible and the full WAV is not kept in memory.
   size_t maxTextChunkBytes = 4096;
+
+  // Maximum HTTP/text payload accepted by API server and direct inputs.
+  size_t maxInputBytes = 10 * 1024 * 1024;
+
+  // Direct text/file inputs for one-shot synthesis.
+  optional<string> inputText;
+  optional<filesystem::path> inputFilePath;
+
+  // API server mode.
+  bool serverMode = false;
+  string serverHost = "127.0.0.1";
+  int serverPort = 8080;
+  filesystem::path modelsDir = filesystem::path("models");
+  bool outputDirExplicit = false;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
@@ -112,8 +129,9 @@ int main(int argc, char *argv[]) {
   parseArgs(argc, argv, runConfig);
 
 #ifdef _WIN32
-  // Required on Windows to show IPA symbols
+  // Required on Windows to preserve UTF-8 text, IPA symbols and Spanish accents.
   SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
 #endif
 
   piper::PiperConfig piperConfig;
@@ -234,17 +252,81 @@ int main(int argc, char *argv[]) {
     spdlog::info("Output directory: {}", runConfig.outputPath.value().string());
   }
 
-  if ((runConfig.outputType == OUTPUT_FILE) && !runConfig.jsonInput) {
-    if (!runConfig.outputPath || runConfig.outputPath->empty()) {
-      throw runtime_error("No output path provided");
+  auto timestampedOutputPath = [&runConfig]() {
+    const auto now = chrono::system_clock::now();
+    const auto timestamp =
+        chrono::duration_cast<chrono::nanoseconds>(now.time_since_epoch())
+            .count();
+    stringstream outputName;
+    outputName << timestamp << ".wav";
+    filesystem::path outputPath = runConfig.outputPath.value_or(".");
+    outputPath.append(outputName.str());
+    return outputPath;
+  };
+
+  if (runConfig.serverMode) {
+    piper_server::ServerOptions serverOptions;
+    serverOptions.host = runConfig.serverHost;
+    serverOptions.port = runConfig.serverPort;
+    serverOptions.modelsDir = filesystem::absolute(runConfig.modelsDir);
+    serverOptions.outputDir = filesystem::absolute(
+        runConfig.outputDirExplicit ? runConfig.outputPath.value()
+                                    : filesystem::path("outputs"));
+    serverOptions.activeModelPath = filesystem::absolute(runConfig.modelPath);
+    serverOptions.maxInputBytes = runConfig.maxInputBytes;
+    serverOptions.maxTextChunkBytes = runConfig.maxTextChunkBytes;
+
+    piper_server::runServer(piperConfig, voice, serverOptions);
+    piper::terminate(piperConfig);
+    return EXIT_SUCCESS;
+  }
+
+  if (!runConfig.jsonInput && (runConfig.inputText || runConfig.inputFilePath ||
+                               (runConfig.outputType == OUTPUT_FILE))) {
+    filesystem::path outputPath;
+    if (runConfig.outputType == OUTPUT_FILE) {
+      if (!runConfig.outputPath || runConfig.outputPath->empty()) {
+        throw runtime_error("No output path provided");
+      }
+      outputPath = runConfig.outputPath.value();
+    } else if (runConfig.outputType == OUTPUT_DIRECTORY) {
+      outputPath = timestampedOutputPath();
+    } else if (runConfig.outputType == OUTPUT_STDOUT) {
+      outputPath.clear();
+    } else {
+      throw runtime_error("--input-file/--text are not supported with --output_raw");
     }
 
-    filesystem::path outputPath = runConfig.outputPath.value();
-    ofstream audioFile(outputPath.string(), ios::binary);
     piper::SynthesisResult result;
-    piper::textToWavFileFromStream(piperConfig, voice, cin, audioFile, result,
-                                   runConfig.maxTextChunkBytes);
-    cout << outputPath.string() << endl;
+    std::unique_ptr<std::istream> ownedInput;
+    std::istream *inputStream = &cin;
+
+    if (runConfig.inputText) {
+      ownedInput = std::make_unique<std::istringstream>(*runConfig.inputText);
+      inputStream = ownedInput.get();
+    } else if (runConfig.inputFilePath) {
+      auto fileInput = std::make_unique<std::ifstream>(
+          runConfig.inputFilePath->string(), ios::binary);
+      if (!fileInput->good()) {
+        throw runtime_error("Input text file doesn't exist");
+      }
+      inputStream = fileInput.get();
+      ownedInput = std::move(fileInput);
+    }
+
+    if (runConfig.outputType == OUTPUT_STDOUT) {
+#ifdef _WIN32
+      setmode(fileno(stdout), O_BINARY);
+#endif
+      piper::textToWavFileFromStream(piperConfig, voice, *inputStream, cout,
+                                     result, runConfig.maxTextChunkBytes);
+    } else {
+      ofstream audioFile(outputPath.string(), ios::binary);
+      piper::textToWavFileFromStream(piperConfig, voice, *inputStream, audioFile,
+                                     result, runConfig.maxTextChunkBytes);
+      cout << outputPath.string() << endl;
+    }
+
     spdlog::info("Real-time factor: {} (infer={} sec, audio={} sec)",
                  result.realTimeFactor, result.inferSeconds,
                  result.audioSeconds);
@@ -453,15 +535,30 @@ void printUsage(char *argv[]) {
   cerr << "   --tashkeel_model        FILE  path to libtashkeel onnx model "
           "(arabic)"
        << endl;
+  cerr << "   --text                  TEXT  synthesize a direct text payload"
+       << endl;
+  cerr << "   --input_file            FILE  read text from a UTF-8 text file"
+       << endl;
   cerr << "   --json-input                  stdin input is lines of JSON "
           "instead of plain text"
+       << endl;
+  cerr << "   --server                      start local HTTP API server" << endl;
+  cerr << "   --host                  IP    server host (default: 127.0.0.1)"
+       << endl;
+  cerr << "   --port                  NUM   server port (default: 8080)"
+       << endl;
+  cerr << "   --models                DIR   models directory for server mode "
+          "(default: models/)"
+       << endl;
+  cerr << "   --max-input-bytes       NUM   max API/direct input bytes "
+          "(default: 10485760)"
        << endl;
   cerr << "   --use-cuda                    use CUDA execution provider"
        << endl;
   cerr << "   --cpu-threads           NUM   limit ONNX Runtime CPU threads"
        << endl;
-  cerr << "   --max-text-chunk-bytes  NUM   split long input before synthesis "
-          "(default: 4096)"
+  cerr << "   --max-text-chunk-bytes  NUM   preferred smart chunk size before "
+          "synthesis (default: 4096)"
        << endl;
   cerr << "   --debug                       print DEBUG messages to the console"
        << endl;
@@ -500,10 +597,11 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         runConfig.outputType = OUTPUT_FILE;
         runConfig.outputPath = filesystem::path(filePath);
       }
-    } else if (arg == "-d" || arg == "--output_dir" || arg == "output-dir") {
+    } else if (arg == "-d" || arg == "--output_dir" || arg == "--output-dir") {
       ensureArg(argc, argv, i);
       runConfig.outputType = OUTPUT_DIRECTORY;
       runConfig.outputPath = filesystem::path(argv[++i]);
+      runConfig.outputDirExplicit = true;
     } else if (arg == "--output_raw" || arg == "--output-raw") {
       runConfig.outputType = OUTPUT_RAW;
     } else if (arg == "-s" || arg == "--speaker") {
@@ -544,10 +642,30 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "--tashkeel_model" || arg == "--tashkeel-model") {
       ensureArg(argc, argv, i);
       runConfig.tashkeelModelPath = filesystem::path(argv[++i]);
+    } else if (arg == "--text") {
+      ensureArg(argc, argv, i);
+      runConfig.inputText = string(argv[++i]);
+    } else if (arg == "--input_file" || arg == "--input-file") {
+      ensureArg(argc, argv, i);
+      runConfig.inputFilePath = filesystem::path(argv[++i]);
     } else if (arg == "--json_input" || arg == "--json-input") {
       runConfig.jsonInput = true;
     } else if (arg == "--use_cuda" || arg == "--use-cuda") {
       runConfig.useCuda = true;
+    } else if (arg == "--server") {
+      runConfig.serverMode = true;
+    } else if (arg == "--host") {
+      ensureArg(argc, argv, i);
+      runConfig.serverHost = string(argv[++i]);
+    } else if (arg == "--port") {
+      ensureArg(argc, argv, i);
+      runConfig.serverPort = stoi(argv[++i]);
+      if ((runConfig.serverPort < 1) || (runConfig.serverPort > 65535)) {
+        throw runtime_error("--port must be between 1 and 65535");
+      }
+    } else if (arg == "--models") {
+      ensureArg(argc, argv, i);
+      runConfig.modelsDir = filesystem::path(argv[++i]);
     } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
       ensureArg(argc, argv, i);
       runConfig.cpuThreads = stoi(argv[++i]);
@@ -562,6 +680,13 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         throw runtime_error("--max-text-chunk-bytes must be >= 512");
       }
       runConfig.maxTextChunkBytes = static_cast<size_t>(chunkBytes);
+    } else if (arg == "--max_input_bytes" || arg == "--max-input-bytes") {
+      ensureArg(argc, argv, i);
+      long inputBytes = stol(argv[++i]);
+      if (inputBytes < 1024) {
+        throw runtime_error("--max-input-bytes must be >= 1024");
+      }
+      runConfig.maxInputBytes = static_cast<size_t>(inputBytes);
     } else if (arg == "--version") {
       std::cout << piper::getVersion() << std::endl;
       exit(0);
@@ -575,6 +700,44 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
       printUsage(argv);
       exit(0);
     }
+  }
+
+  if (runConfig.inputText && runConfig.inputFilePath) {
+    throw runtime_error("Use either --text or --input-file, not both");
+  }
+
+  if (runConfig.inputFilePath) {
+    ifstream inputFile(runConfig.inputFilePath->c_str(), ios::binary);
+    if (!inputFile.good()) {
+      throw runtime_error("Input text file doesn't exist");
+    }
+  }
+
+  if (runConfig.serverMode) {
+    filesystem::create_directories(runConfig.modelsDir);
+
+    if (runConfig.modelPath.empty()) {
+      auto maybeModel = piper_server::findFirstUsableModel(runConfig.modelsDir);
+      if (maybeModel) {
+        runConfig.modelPath = maybeModel->modelPath;
+        if (!modelConfigPath) {
+          modelConfigPath = maybeModel->configPath;
+        }
+      } else {
+        throw runtime_error(
+            "No usable .onnx model found. The models directory was created; "
+            "copy a model and its .onnx.json config there or pass --model.");
+      }
+    } else if (!filesystem::exists(runConfig.modelPath)) {
+      auto modelInModelsDir = runConfig.modelsDir / runConfig.modelPath;
+      if (filesystem::exists(modelInModelsDir)) {
+        runConfig.modelPath = modelInModelsDir;
+      }
+    }
+  }
+
+  if (runConfig.modelPath.empty()) {
+    throw runtime_error("Model file is required. Use --model FILE");
   }
 
   // Verify model file exists
