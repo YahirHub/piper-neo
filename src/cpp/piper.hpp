@@ -108,6 +108,10 @@ Phoneme getCodepoint(std::string s);
 // Get version of Piper
 std::string getVersion();
 
+// Split UTF-8 text into smart chunks without breaking normal words or Spanish questions when possible.
+std::vector<std::string> splitTextIntoChunks(const std::string &text,
+                                             std::size_t maxChunkBytes);
+
 // Must be called before using textTo* functions
 void initialize(PiperConfig &config);
 

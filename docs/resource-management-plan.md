@@ -1,139 +1,132 @@
-# Plan de mantenimiento: gestión de recursos para textos largos
+# Gestión de CPU/RAM y plan de mantenimiento
 
-## Diagnóstico del código original
+## Problema original
 
-El flujo C++ cargaba o acumulaba demasiado trabajo en memoria cuando se enviaban textos muy largos:
+El flujo original podía colapsar con textos extremadamente largos porque trabajaba demasiado de una sola vez:
 
-1. `--output_file` leía todo `stdin` en un `stringstream` antes de sintetizar, por lo que un texto grande duplicaba memoria desde el inicio.
-2. `textToWavFile` generaba todo el audio en un único `std::vector<int16_t>` y solo después escribía el WAV.
-3. Una línea o frase extremadamente larga podía llegar completa a fonemización e inferencia ONNX.
-4. `SynthesisResult` no inicializaba sus métricas por defecto.
-5. Los logs de debug podían imprimir el texto completo, aumentando uso de memoria/terminal con entradas enormes.
-6. ONNX Runtime no tenía una opción CLI para limitar hilos de CPU.
-7. En modo API, si el cliente cerraba la conexión, el servidor podía seguir generando un audio que nadie iba a recibir.
+1. Leía texto completo en memoria.
+2. Generaba audio en un único buffer grande.
+3. No limitaba suficientemente hilos de CPU.
+4. Un texto gigante podía monopolizar la inferencia.
+5. En API, si el cliente cerraba conexión, el proceso podía seguir generando audio innecesario.
 
-## Mejoras implementadas
+## Gestión actual de RAM
 
-### 1. WAV progresivo
+El servidor evita picos grandes de memoria con estas reglas:
 
-- El audio se escribe por bloques durante la síntesis.
-- En archivos seekables se escribe un header provisional y se corrige el tamaño real al finalizar.
-- En stdout/pipes se escribe un header de streaming de mejor esfuerzo y se recomienda `--output_raw` para flujos sin límite.
-- Ya no se necesita tener todo el WAV en RAM antes de guardarlo.
+- Divide texto en chunks inteligentes.
+- No corta UTF-8 ni caracteres como `á`, `ñ`, `¿`, `¡`.
+- Escribe cada chunk a un temporal RAW.
+- Une los temporales en orden al WAV final.
+- Borra `outputs/tmp/<job_id>/` al terminar, fallar o cancelar.
+- Limita el tamaño de entrada con `--max-input-bytes`.
+- Limita el tamaño preferido de chunk con `--max-text-chunk-bytes`.
+- Limita réplicas ONNX con `--max-model-replicas`.
 
-### 2. Entrada larga por streaming
+## Gestión actual de CPU
 
-- `--output_file` con entrada de texto plano ya no concatena todo `stdin`.
-- Se lee línea por línea y se divide en fragmentos antes de fonemizar/sintetizar.
-- `--input_file` permite leer un `.txt` directamente sin depender del shell.
-
-### 3. Chunking inteligente y seguro para UTF-8
-
-El divisor intenta respetar este orden:
-
-1. Preguntas/exclamaciones españolas completas: `¿...?`, `¡...!`.
-2. Párrafos.
-3. Frases terminadas en `.`, `?`, `!` o `…`.
-4. Pausas suaves: `,`, `;`, `:`.
-5. Espacios en blanco.
-6. Como último recurso, corte seguro en frontera UTF-8.
-
-Esto evita romper acentos, `ñ`, `¿`, `¡` y palabras normales. Si una palabra o frase es exageradamente grande, corta en un punto seguro para proteger RAM/CPU.
-
-### 4. Control de CPU
-
-- Se agregó `--cpu-threads NUM` para limitar hilos de ONNX Runtime.
-- Internamente se configura `SetIntraOpNumThreads(NUM)` y `SetInterOpNumThreads(1)`.
-- También se desactivan optimizaciones de memoria que pueden incrementar picos en algunos escenarios: CPU mem arena, memory pattern y profiling.
-
-### 5. Concurrencia controlada en API
-
-- El servidor permite varias síntesis simultáneas con `--max-concurrent-jobs`.
-- Para solicitudes del mismo modelo, usa réplicas ONNX controladas por `--max-model-replicas`.
-- Si se alcanza el límite global o el límite de réplicas, responde HTTP 429 con `server_busy`.
-- Esto permite paralelismo real sin dejar que textos largos creen procesos/hilos sin control ni saturen RAM/CPU.
-
-### 6. Cancelación por desconexión del cliente
-
-- En `POST /api/v1/tts`, el servidor revisa si el socket del cliente sigue conectado.
-- La revisión ocurre antes de iniciar y entre chunks/frases/callbacks de escritura.
-- Si el cliente cerró la conexión, se cancela la síntesis, se borra el WAV parcial y se libera el mutex.
-- No se interrumpe agresivamente una llamada individual de ONNX a media inferencia; la cancelación ocurre en el siguiente punto seguro.
-
-### 7. Métricas inicializadas
-
-- `SynthesisResult` ahora inicia en cero para evitar valores basura o acumulados inesperados.
-
-### 8. Logs seguros
-
-- Los logs de texto largo ahora muestran solo una vista previa y el tamaño total en bytes.
-
-## Uso recomendado CLI
-
-Para generar un WAV largo sin saturar memoria:
+El servidor usa auto-configuración por defecto:
 
 ```bash
-./piper \
-  --model voz.onnx \
-  --input_file texto_largo.txt \
-  --output_file salida.wav \
-  --max-text-chunk-bytes 4096 \
-  --cpu-threads 2
+./piper --server --models models
 ```
 
-Para streaming sin header WAV rígido:
+Eso aplica `--cpu-profile balanced` automáticamente. El servidor calcula:
+
+- Hilos disponibles del hardware.
+- Hilos ONNX por worker.
+- Número de workers de chunks.
+- Máximo de trabajos activos.
+- Máximo de réplicas por modelo.
+- Tamaño de cola.
+
+No usa todos los hilos del CPU en cada solicitud, porque eso causa oversubscription. En su lugar reparte pocos hilos por worker.
+
+## Scheduler justo
+
+Cada request se convierte en un job. Cada job se divide en chunks:
+
+```txt
+A: A1 A2 A3 A4
+B: B1 B2
+C: C1 C2 C3
+```
+
+El scheduler procesa en round-robin:
+
+```txt
+A1 → B1 → C1 → A2 → B2 → C2 → A3 → C3 → A4
+```
+
+Así un texto enorme no bloquea a textos pequeños.
+
+## Concurrencia
+
+La concurrencia se controla con:
 
 ```bash
-cat texto_largo.txt | ./piper \
-  --model voz.onnx \
-  --output_raw \
-  --cpu-threads 2 > salida.raw
+--max-concurrent-jobs
+--chunk-workers
+--max-model-replicas
+--queue-size
+--queue-timeout-seconds
+--cpu-threads
 ```
 
-## Uso recomendado API protegida
-
-`.env`:
-
-```env
-PIPER_API_TOKEN=mi-token-largo-y-seguro
-```
-
-Servidor:
+Recomendación para CPU de 8 hilos:
 
 ```bash
-./piper \
-  --server \
-  --models models \
-  --host 127.0.0.1 \
-  --port 8080 \
+./piper --server --models models \
+  --cpu-profile balanced
+```
+
+Override manual:
+
+```bash
+./piper --server --models models \
   --cpu-threads 2 \
-  --max-text-chunk-bytes 4096 \
-  --max-concurrent-jobs 2 \
-  --max-model-replicas 2
+  --max-concurrent-jobs 3 \
+  --chunk-workers 3 \
+  --max-model-replicas 2 \
+  --queue-size 32
 ```
 
-Petición:
+## Cancelación
 
-```bash
-curl -X POST http://127.0.0.1:8080/api/v1/tts \
-  -H "Authorization: Bearer mi-token-largo-y-seguro" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"es_MX-Veritasium.onnx","text":"Hola, ¿cómo estás?","output_file":"demo.wav"}'
+Si el cliente cierra conexión:
+
+- El job se marca como cancelado.
+- Ya no se programan más chunks.
+- Se espera a que termine el chunk actual en ONNX.
+- Se borran temporales y WAV parcial.
+- Se libera la réplica del modelo.
+
+## Metadata de modelos
+
+`/api/v1/models` lee los `.onnx.json` y devuelve metadata útil:
+
+- `audio.sample_rate`
+- `audio.quality`
+- `espeak.voice`
+- `language.code`
+- `inference.noise_scale`
+- `inference.length_scale`
+- `inference.noise_w`
+- `num_speakers`
+- `piper_version`
+- `modelcard` sin imagen base64
+
+La imagen se sirve aparte:
+
+```txt
+GET /api/v1/models/{model}/image
 ```
 
-## Siguientes mejoras sugeridas
+## Próximas mejoras sugeridas
 
-1. **Límite por inferencia ONNX**
-   - Agregar `--max-phoneme-ids` para dividir frases que produzcan demasiados IDs aun después del chunking por texto.
-
-2. **Backpressure real en `--output_raw`**
-   - Cambiar el buffer compartido por una cola acotada para que el sintetizador espere si stdout está lento.
-
-3. **Límites de memoria configurables**
-   - Agregar `--max-audio-buffer-mb` y fallback a streaming obligatorio.
-
-4. **Cola de trabajos opcional**
-   - Permitir `--queue-size N` para encolar trabajos en vez de devolver `server_busy` inmediatamente.
-
-5. **Pruebas de estrés**
-   - Añadir tests que generen entradas de 100 KB, 1 MB y frases sin espacios para validar que la RAM permanezca estable.
+1. Cache LRU de modelos con `--max-loaded-models` y `--model-idle-ttl-seconds`.
+2. Cache de fonemas para frases repetidas.
+3. Endpoint async con job id para audios muy largos.
+4. Límites por duración estimada de audio.
+5. Tests de estrés con 5, 10 y 20 clientes concurrentes.
+6. Benchmarks automáticos por perfil CPU.

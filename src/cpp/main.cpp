@@ -96,6 +96,7 @@ struct RunConfig {
 
   // 0 or nullopt lets ONNX Runtime choose its default thread count.
   optional<int> cpuThreads;
+  bool cpuThreadsExplicit = false;
 
   // Maximum preferred text chunk size before phonemization/synthesis.
   // Long inputs are split intelligently so words/questions are preserved when
@@ -115,12 +116,17 @@ struct RunConfig {
   int serverPort = 8080;
   filesystem::path modelsDir = filesystem::path("models");
   optional<string> apiToken;
-  size_t maxConcurrentJobs = 2;
-  size_t maxModelReplicas = 2;
+  size_t maxConcurrentJobs = 0;
+  size_t maxModelReplicas = 0;
+  size_t chunkWorkers = 0;
+  size_t queueSize = 0;
+  size_t queueTimeoutSeconds = 60;
+  string cpuProfile = "balanced";
   bool outputDirExplicit = false;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
+void applyAutoServerResourceConfig(RunConfig &runConfig);
 optional<string> resolveApiToken(const optional<string> &explicitToken);
 void rawOutputProc(vector<int16_t> &sharedAudioBuffer, mutex &mutAudio,
                    condition_variable &cvAudio, bool &audioReady,
@@ -287,6 +293,10 @@ int main(int argc, char *argv[]) {
     serverOptions.maxTextChunkBytes = runConfig.maxTextChunkBytes;
     serverOptions.maxConcurrentJobs = runConfig.maxConcurrentJobs;
     serverOptions.maxModelReplicas = runConfig.maxModelReplicas;
+    serverOptions.chunkWorkers = runConfig.chunkWorkers;
+    serverOptions.queueSize = runConfig.queueSize;
+    serverOptions.queueTimeoutSeconds = runConfig.queueTimeoutSeconds;
+    serverOptions.cpuProfile = runConfig.cpuProfile;
     serverOptions.apiToken = resolveApiToken(runConfig.apiToken).value_or("");
 
     piper_server::runServer(piperConfig, voice, serverOptions);
@@ -481,6 +491,99 @@ int main(int argc, char *argv[]) {
 
 // ----------------------------------------------------------------------------
 
+size_t clampSize(size_t value, size_t minValue, size_t maxValue) {
+  return std::max(minValue, std::min(value, maxValue));
+}
+
+void applyAutoServerResourceConfig(RunConfig &runConfig) {
+  // Track which knobs were explicitly provided so we can auto-tune safely without
+  // surprising users who intentionally overrode values.
+  const bool cpuThreadsExplicit = runConfig.cpuThreadsExplicit;
+  const bool chunkWorkersExplicit = runConfig.chunkWorkers != 0;
+  const bool queueSizeExplicit = runConfig.queueSize != 0;
+
+  unsigned int hardwareThreads = std::thread::hardware_concurrency();
+  if (hardwareThreads == 0) {
+    hardwareThreads = 2;
+  }
+
+  size_t autoCpuThreads = 1;
+  size_t autoMaxJobs = 1;
+  size_t autoChunkWorkers = 1;
+  size_t autoReplicas = 1;
+  size_t autoQueueSize = 16;
+
+  if (runConfig.cpuProfile == "eco") {
+    autoCpuThreads = 1;
+    autoMaxJobs = hardwareThreads >= 4 ? 2 : 1;
+    autoChunkWorkers = autoMaxJobs;
+    autoReplicas = 1;
+    autoQueueSize = 16;
+  } else if (runConfig.cpuProfile == "fast") {
+    autoCpuThreads = hardwareThreads >= 8 ? 3 : (hardwareThreads >= 4 ? 2 : 1);
+    autoMaxJobs = hardwareThreads >= 12 ? 5 : (hardwareThreads >= 8 ? 4 : 2);
+    autoChunkWorkers = hardwareThreads >= 12 ? 5 : (hardwareThreads >= 8 ? 4 : 2);
+    autoReplicas = hardwareThreads >= 12 ? 3 : 2;
+    autoQueueSize = 48;
+  } else if (runConfig.cpuProfile == "max") {
+    autoCpuThreads = std::max<size_t>(1, hardwareThreads / 2);
+    autoMaxJobs = hardwareThreads >= 16 ? 6 : (hardwareThreads >= 8 ? 4 : 2);
+    autoChunkWorkers = autoMaxJobs;
+    autoReplicas = hardwareThreads >= 16 ? 4 : (hardwareThreads >= 8 ? 3 : 2);
+    autoQueueSize = 64;
+  } else {
+    // balanced
+    autoCpuThreads = hardwareThreads >= 6 ? 2 : 1;
+    autoMaxJobs = hardwareThreads >= 12 ? 4 : (hardwareThreads >= 6 ? 3 : (hardwareThreads >= 4 ? 2 : 1));
+    autoChunkWorkers = autoMaxJobs;
+    autoReplicas = hardwareThreads >= 12 ? 3 : (hardwareThreads >= 6 ? 2 : 1);
+    autoQueueSize = 32;
+  }
+
+  if (!cpuThreadsExplicit && !runConfig.cpuThreads) {
+    runConfig.cpuThreads = static_cast<int>(autoCpuThreads);
+  }
+
+  if (runConfig.maxConcurrentJobs == 0) {
+    runConfig.maxConcurrentJobs = autoMaxJobs;
+  }
+
+  if (runConfig.chunkWorkers == 0) {
+    runConfig.chunkWorkers = autoChunkWorkers;
+  }
+
+  if (runConfig.maxModelReplicas == 0) {
+    runConfig.maxModelReplicas = autoReplicas;
+  }
+
+  if (runConfig.queueSize == 0) {
+    runConfig.queueSize = std::max<size_t>(autoQueueSize, runConfig.maxConcurrentJobs);
+  }
+
+  // Prevent accidental oversubscription when the user overrides only part of the policy.
+  const size_t cpuThreads = static_cast<size_t>(runConfig.cpuThreads.value_or(1));
+  const size_t safeWorkersByCpu = std::max<size_t>(1, hardwareThreads / std::max<size_t>(1, cpuThreads));
+
+  if (!chunkWorkersExplicit) {
+    runConfig.chunkWorkers = clampSize(runConfig.chunkWorkers, 1, safeWorkersByCpu);
+  }
+
+  runConfig.maxConcurrentJobs = std::max<size_t>(1, runConfig.maxConcurrentJobs);
+  runConfig.maxModelReplicas = std::max<size_t>(1, runConfig.maxModelReplicas);
+
+  // Keep queue >= active jobs unless the user explicitly wants otherwise.
+  if (!queueSizeExplicit) {
+    runConfig.queueSize = std::max(runConfig.queueSize, runConfig.maxConcurrentJobs);
+  }
+
+  spdlog::info("Server resource policy: profile={} hardware_threads={} cpu_threads={} max_jobs={} chunk_workers={} max_model_replicas={} queue_size={}",
+               runConfig.cpuProfile, hardwareThreads, runConfig.cpuThreads.value_or(0),
+               runConfig.maxConcurrentJobs, runConfig.chunkWorkers,
+               runConfig.maxModelReplicas, runConfig.queueSize);
+}
+
+// ----------------------------------------------------------------------------
+
 string trimEnvValue(string value) {
   auto isSpace = [](unsigned char c) { return std::isspace(c) != 0; };
   while (!value.empty() && isSpace(static_cast<unsigned char>(value.front()))) {
@@ -652,11 +755,23 @@ void printUsage(char *argv[]) {
   cerr << "   --api-token             TOKEN protect API server with bearer token"
        << endl;
   cerr << "                                env/.env: PIPER_API_TOKEN" << endl;
-  cerr << "   --max-concurrent-jobs   NUM   max simultaneous TTS jobs in API "
-          "mode (default: 2)"
+  cerr << "   --cpu-profile           NAME  auto resource profile: eco, balanced, "
+          "fast, max (server default: balanced)"
        << endl;
-  cerr << "   --max-model-replicas    NUM   max ONNX replicas per model for "
-          "parallel API jobs (default: 2)"
+  cerr << "   --max-concurrent-jobs   NUM   max accepted simultaneous API jobs "
+          "(default: auto)"
+       << endl;
+  cerr << "   --chunk-workers         NUM   fair chunk worker count "
+          "(default: auto)"
+       << endl;
+  cerr << "   --max-model-replicas    NUM   max ONNX replicas per model "
+          "(default: auto)"
+       << endl;
+  cerr << "   --queue-size            NUM   max waiting/active API jobs "
+          "(default: auto)"
+       << endl;
+  cerr << "   --queue-timeout-seconds NUM   seconds a job may wait in queue "
+          "(default: 60)"
        << endl;
   cerr << "   --max-input-bytes       NUM   max API/direct input bytes "
           "(default: 10485760)"
@@ -777,6 +892,13 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "--api-token" || arg == "--api_token") {
       ensureArg(argc, argv, i);
       runConfig.apiToken = string(argv[++i]);
+    } else if (arg == "--cpu-profile" || arg == "--cpu_profile") {
+      ensureArg(argc, argv, i);
+      runConfig.cpuProfile = string(argv[++i]);
+      if (runConfig.cpuProfile != "eco" && runConfig.cpuProfile != "balanced" &&
+          runConfig.cpuProfile != "fast" && runConfig.cpuProfile != "max") {
+        throw runtime_error("--cpu-profile must be eco, balanced, fast or max");
+      }
     } else if (arg == "--max-concurrent-jobs" || arg == "--max_concurrent_jobs") {
       ensureArg(argc, argv, i);
       long maxJobs = stol(argv[++i]);
@@ -784,6 +906,13 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         throw runtime_error("--max-concurrent-jobs must be >= 1");
       }
       runConfig.maxConcurrentJobs = static_cast<size_t>(maxJobs);
+    } else if (arg == "--chunk-workers" || arg == "--chunk_workers") {
+      ensureArg(argc, argv, i);
+      long workers = stol(argv[++i]);
+      if (workers < 1) {
+        throw runtime_error("--chunk-workers must be >= 1");
+      }
+      runConfig.chunkWorkers = static_cast<size_t>(workers);
     } else if (arg == "--max-model-replicas" || arg == "--max_model_replicas") {
       ensureArg(argc, argv, i);
       long maxReplicas = stol(argv[++i]);
@@ -791,11 +920,31 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         throw runtime_error("--max-model-replicas must be >= 1");
       }
       runConfig.maxModelReplicas = static_cast<size_t>(maxReplicas);
+    } else if (arg == "--queue-size" || arg == "--queue_size") {
+      ensureArg(argc, argv, i);
+      long queueSize = stol(argv[++i]);
+      if (queueSize < 1) {
+        throw runtime_error("--queue-size must be >= 1");
+      }
+      runConfig.queueSize = static_cast<size_t>(queueSize);
+    } else if (arg == "--queue-timeout-seconds" || arg == "--queue_timeout_seconds") {
+      ensureArg(argc, argv, i);
+      long timeoutSeconds = stol(argv[++i]);
+      if (timeoutSeconds < 1) {
+        throw runtime_error("--queue-timeout-seconds must be >= 1");
+      }
+      runConfig.queueTimeoutSeconds = static_cast<size_t>(timeoutSeconds);
     } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
       ensureArg(argc, argv, i);
-      runConfig.cpuThreads = stoi(argv[++i]);
-      if (runConfig.cpuThreads.value() < 1) {
-        throw runtime_error("--cpu-threads must be >= 1");
+      string cpuThreadsArg = argv[++i];
+      runConfig.cpuThreadsExplicit = true;
+      if (cpuThreadsArg == "auto") {
+        runConfig.cpuThreads.reset();
+      } else {
+        runConfig.cpuThreads = stoi(cpuThreadsArg);
+        if (runConfig.cpuThreads.value() < 1) {
+          throw runtime_error("--cpu-threads must be >= 1 or auto");
+        }
       }
     } else if (arg == "--max_text_chunk_bytes" ||
                arg == "--max-text-chunk-bytes") {
@@ -838,10 +987,6 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     }
   }
 
-  if (runConfig.maxModelReplicas > runConfig.maxConcurrentJobs) {
-    runConfig.maxModelReplicas = runConfig.maxConcurrentJobs;
-  }
-
   if (runConfig.serverMode) {
     filesystem::create_directories(runConfig.modelsDir);
 
@@ -863,6 +1008,10 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         runConfig.modelPath = modelInModelsDir;
       }
     }
+  }
+
+  if (runConfig.serverMode) {
+    applyAutoServerResourceConfig(runConfig);
   }
 
   if (runConfig.modelPath.empty()) {

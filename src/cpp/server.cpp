@@ -2,10 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <set>
+#include <deque>
+#include <condition_variable>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <cerrno>
+#include <limits>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <fstream>
@@ -401,21 +407,293 @@ void sendJson(SocketHandle socketHandle, int statusCode, const json &body) {
                body.dump(2));
 }
 
+struct ParsedTarget {
+  std::string path;
+  std::map<std::string, std::string> query;
+};
+
+std::string urlDecode(const std::string &value) {
+  std::string decoded;
+  decoded.reserve(value.size());
+  for (std::size_t i = 0; i < value.size(); ++i) {
+    if (value[i] == '%' && (i + 2) < value.size()) {
+      const auto hex = value.substr(i + 1, 2);
+      char *end = nullptr;
+      long code = std::strtol(hex.c_str(), &end, 16);
+      if (end != nullptr && *end == '\0') {
+        decoded.push_back(static_cast<char>(code));
+        i += 2;
+        continue;
+      }
+    }
+    if (value[i] == '+') {
+      decoded.push_back(' ');
+    } else {
+      decoded.push_back(value[i]);
+    }
+  }
+  return decoded;
+}
+
+ParsedTarget parseTarget(const std::string &rawPath) {
+  ParsedTarget target;
+  const auto question = rawPath.find('?');
+  target.path = question == std::string::npos ? rawPath : rawPath.substr(0, question);
+  if (question == std::string::npos) {
+    return target;
+  }
+
+  std::string queryString = rawPath.substr(question + 1);
+  std::size_t offset = 0;
+  while (offset <= queryString.size()) {
+    const auto amp = queryString.find('&', offset);
+    const auto part = queryString.substr(offset, amp == std::string::npos ? std::string::npos : amp - offset);
+    if (!part.empty()) {
+      const auto equals = part.find('=');
+      const auto key = urlDecode(part.substr(0, equals));
+      const auto value = equals == std::string::npos ? std::string() : urlDecode(part.substr(equals + 1));
+      target.query[lowerCopy(key)] = value;
+    }
+    if (amp == std::string::npos) {
+      break;
+    }
+    offset = amp + 1;
+  }
+  return target;
+}
+
+std::optional<std::string> queryValue(const ParsedTarget &target,
+                                      const std::string &name) {
+  auto it = target.query.find(lowerCopy(name));
+  if (it == target.query.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
 std::optional<std::string> routeFileName(const std::string &path) {
   const std::string prefix = "/api/v1/files/";
   if (path.rfind(prefix, 0) != 0) {
     return std::nullopt;
   }
 
-  return path.substr(prefix.size());
+  return urlDecode(path.substr(prefix.size()));
 }
 
-json modelInfoToJson(const ModelInfo &modelInfo) {
-  return json{{"name", modelInfo.name},
-              {"model_file", modelInfo.modelPath.string()},
-              {"config_file", modelInfo.configPath.string()},
-              {"has_config", modelInfo.hasConfig}};
+std::optional<std::string> routeModelImageName(const std::string &path) {
+  const std::string prefix = "/api/v1/models/";
+  const std::string suffix = "/image";
+  if (path.rfind(prefix, 0) != 0 || path.size() <= (prefix.size() + suffix.size())) {
+    return std::nullopt;
+  }
+
+  if (path.substr(path.size() - suffix.size()) != suffix) {
+    return std::nullopt;
+  }
+
+  return urlDecode(path.substr(prefix.size(), path.size() - prefix.size() - suffix.size()));
 }
+
+json loadJsonFile(const std::filesystem::path &path) {
+  std::ifstream file(path.string(), std::ios::binary);
+  if (!file.good()) {
+    throw std::runtime_error("not_found");
+  }
+  json root;
+  file >> root;
+  return root;
+}
+
+std::optional<json> tryLoadJsonFile(const std::filesystem::path &path,
+                                    std::string &error) {
+  try {
+    return loadJsonFile(path);
+  } catch (const json::exception &) {
+    error = "invalid_json";
+  } catch (const std::exception &e) {
+    error = e.what();
+  }
+  return std::nullopt;
+}
+
+template <typename T>
+void copyIfExists(json &to, const json &from, const std::string &key) {
+  if (from.contains(key) && !from[key].is_null()) {
+    try {
+      to[key] = from[key].get<T>();
+    } catch (const json::exception &) {
+      // Ignore invalid metadata fields. A bad optional field should not hide a model.
+    }
+  }
+}
+
+bool modelJsonHasImage(const json &root) {
+  return root.contains("modelcard") && root["modelcard"].is_object() &&
+         root["modelcard"].contains("image") && root["modelcard"]["image"].is_string() &&
+         !root["modelcard"]["image"].get<std::string>().empty();
+}
+
+json modelInfoToJson(const ModelInfo &modelInfo, const std::string &includeMode) {
+  json out{{"file", modelInfo.name},
+           {"name", modelInfo.name},
+           {"model_file", modelInfo.modelPath.string()},
+           {"config_file", modelInfo.configPath.string()},
+           {"available", std::filesystem::exists(modelInfo.modelPath)},
+           {"has_config", modelInfo.hasConfig},
+           {"config_valid", false}};
+
+  if (!modelInfo.hasConfig) {
+    return out;
+  }
+
+  std::string configError;
+  auto maybeRoot = tryLoadJsonFile(modelInfo.configPath, configError);
+  if (!maybeRoot) {
+    out["config_error"] = configError.empty() ? "invalid_json" : configError;
+    return out;
+  }
+
+  const auto &root = *maybeRoot;
+  out["config_valid"] = true;
+
+  json modelcard = json::object();
+  if (root.contains("modelcard") && root["modelcard"].is_object()) {
+    const auto &card = root["modelcard"];
+    copyIfExists<std::string>(modelcard, card, "id");
+    copyIfExists<std::string>(modelcard, card, "name");
+    copyIfExists<std::string>(modelcard, card, "description");
+    copyIfExists<std::string>(modelcard, card, "language");
+    copyIfExists<std::string>(modelcard, card, "voiceprompt");
+    copyIfExists<std::string>(modelcard, card, "sha256");
+  }
+
+  const bool hasImage = modelJsonHasImage(root);
+  out["has_image"] = hasImage;
+  if (hasImage) {
+    out["image_url"] = "/api/v1/models/" + modelInfo.name + "/image";
+  }
+
+  if (!modelcard.empty()) {
+    out["modelcard"] = modelcard;
+    if (modelcard.contains("name")) {
+      out["name"] = modelcard["name"];
+    }
+    if (modelcard.contains("language")) {
+      out["language"] = modelcard["language"];
+    }
+  }
+
+  if (includeMode == "basic") {
+    return out;
+  }
+
+  if (root.contains("dataset")) {
+    out["dataset"] = root["dataset"];
+  }
+  if (root.contains("audio") && root["audio"].is_object()) {
+    json audio = json::object();
+    copyIfExists<int>(audio, root["audio"], "sample_rate");
+    copyIfExists<std::string>(audio, root["audio"], "quality");
+    out["audio"] = audio;
+  }
+  if (root.contains("language") && root["language"].is_object()) {
+    // Preserve legacy top-level language string (from modelcard) when returning full metadata.
+    if (out.contains("language") && out["language"].is_string()) {
+      out["language_code"] = out["language"];
+    }
+
+    json language = json::object();
+    copyIfExists<std::string>(language, root["language"], "code");
+    out["language"] = language;
+  }
+  if (root.contains("espeak") && root["espeak"].is_object()) {
+    json espeak = json::object();
+    copyIfExists<std::string>(espeak, root["espeak"], "voice");
+    out["espeak"] = espeak;
+  }
+  if (root.contains("inference") && root["inference"].is_object()) {
+    json inference = json::object();
+    copyIfExists<double>(inference, root["inference"], "noise_scale");
+    copyIfExists<double>(inference, root["inference"], "length_scale");
+    copyIfExists<double>(inference, root["inference"], "noise_w");
+    out["inference"] = inference;
+  }
+  copyIfExists<int>(out, root, "num_speakers");
+  copyIfExists<std::string>(out, root, "piper_version");
+
+  if (includeMode == "technical") {
+    copyIfExists<std::string>(out, root, "phoneme_type");
+    copyIfExists<int>(out, root, "num_symbols");
+    if (root.contains("speaker_id_map") && root["speaker_id_map"].is_object()) {
+      out["speaker_id_map"] = root["speaker_id_map"];
+    }
+  }
+
+  return out;
+}
+
+const std::string BASE64_CHARS =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string decodeBase64(const std::string &encoded) {
+  std::array<int, 256> table{};
+  table.fill(-1);
+  for (int i = 0; i < static_cast<int>(BASE64_CHARS.size()); ++i) {
+    table[static_cast<unsigned char>(BASE64_CHARS[i])] = i;
+  }
+
+  std::string decoded;
+  int val = 0;
+  int valb = -8;
+  for (unsigned char c : encoded) {
+    if (std::isspace(c)) {
+      continue;
+    }
+    if (c == '=') {
+      break;
+    }
+    if (table[c] == -1) {
+      throw std::runtime_error("invalid_image");
+    }
+    val = (val << 6) + table[c];
+    valb += 6;
+    if (valb >= 0) {
+      decoded.push_back(static_cast<char>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return decoded;
+}
+
+std::pair<std::string, std::string> parseDataImage(const std::string &dataUri) {
+  const std::string prefix = "data:image/";
+  if (dataUri.rfind(prefix, 0) != 0) {
+    throw std::runtime_error("invalid_image");
+  }
+  const auto comma = dataUri.find(',');
+  if (comma == std::string::npos) {
+    throw std::runtime_error("invalid_image");
+  }
+  const auto meta = dataUri.substr(0, comma);
+  const auto lowerMeta = lowerCopy(meta);
+  if (lowerMeta.find(";base64") == std::string::npos) {
+    throw std::runtime_error("invalid_image");
+  }
+
+  std::string contentType;
+  if (lowerMeta.rfind("data:image/jpeg", 0) == 0 || lowerMeta.rfind("data:image/jpg", 0) == 0) {
+    contentType = "image/jpeg";
+  } else if (lowerMeta.rfind("data:image/png", 0) == 0) {
+    contentType = "image/png";
+  } else if (lowerMeta.rfind("data:image/webp", 0) == 0) {
+    contentType = "image/webp";
+  } else {
+    throw std::runtime_error("invalid_image");
+  }
+
+  return {contentType, decodeBase64(dataUri.substr(comma + 1))};
+}
+
 
 
 std::string modelKey(const std::filesystem::path &modelPath) {
@@ -551,6 +829,7 @@ struct ModelRuntime {
 
   ModelInfo info;
   std::mutex mutex;
+  std::condition_variable cv;
   std::vector<std::unique_ptr<VoiceSlot>> slots;
   std::size_t loadingSlots = 0;
 };
@@ -590,6 +869,7 @@ struct VoiceLease {
     if (runtime && slot != nullptr) {
       std::lock_guard<std::mutex> lock(runtime->mutex);
       slot->inUse = false;
+      runtime->cv.notify_one();
     }
     slot = nullptr;
     runtime.reset();
@@ -629,8 +909,22 @@ public:
       }
     }
 
-    if ((runtime->slots.size() + runtime->loadingSlots) >= maxReplicas) {
-      throw std::runtime_error("model_busy");
+    while ((runtime->slots.size() + runtime->loadingSlots) >= maxReplicas) {
+      runtime->cv.wait(lock, [&runtime]() {
+        for (const auto &slot : runtime->slots) {
+          if (!slot->inUse) {
+            return true;
+          }
+        }
+        return false;
+      });
+
+      for (const auto &slot : runtime->slots) {
+        if (!slot->inUse) {
+          slot->inUse = true;
+          return VoiceLease(runtime, slot.get());
+        }
+      }
     }
 
     ++runtime->loadingSlots;
@@ -647,6 +941,7 @@ public:
       if (runtime->loadingSlots > 0) {
         --runtime->loadingSlots;
       }
+      runtime->cv.notify_all();
       lock.unlock();
       throw;
     }
@@ -661,6 +956,7 @@ public:
     slot->inUse = true;
     auto *slotPtr = slot.get();
     runtime->slots.push_back(std::move(slot));
+    runtime->cv.notify_all();
     return VoiceLease(runtime, slotPtr);
   }
 
@@ -698,6 +994,512 @@ private:
   std::mutex cacheMutex;
   std::map<std::string, std::shared_ptr<ModelRuntime>> cache;
 };
+
+struct ServerMetrics {
+  std::atomic<std::uint64_t> acceptedJobs{0};
+  std::atomic<std::uint64_t> completedJobs{0};
+  std::atomic<std::uint64_t> cancelledJobs{0};
+  std::atomic<std::uint64_t> failedJobs{0};
+  std::atomic<std::uint64_t> rejectedJobs{0};
+  std::atomic<std::uint64_t> completedChunks{0};
+  std::atomic<std::uint64_t> failedChunks{0};
+  std::atomic<std::uint64_t> processingChunks{0};
+};
+
+struct TtsJobResult {
+  std::string fileName;
+  std::filesystem::path outputPath;
+  std::string modelName;
+  std::filesystem::path modelPath;
+  std::size_t chunks = 0;
+  std::uintmax_t bytes = 0;
+  piper::SynthesisResult synthesis;
+};
+
+struct TtsJobRequest {
+  std::string text;
+  std::string fileName;
+  std::filesystem::path outputPath;
+  std::optional<std::string> requestedModel;
+  std::optional<piper::SpeakerId> speakerId;
+  std::function<bool()> shouldCancel;
+};
+
+struct PcmWavHeader {
+  uint8_t RIFF[4] = {'R', 'I', 'F', 'F'};
+  uint32_t chunkSize = 0;
+  uint8_t WAVE[4] = {'W', 'A', 'V', 'E'};
+  uint8_t fmt[4] = {'f', 'm', 't', ' '};
+  uint32_t fmtSize = 16;
+  uint16_t audioFormat = 1;
+  uint16_t numChannels = 1;
+  uint32_t sampleRate = 22050;
+  uint32_t bytesPerSec = 44100;
+  uint16_t blockAlign = 2;
+  uint16_t bitsPerSample = 16;
+  uint8_t data[4] = {'d', 'a', 't', 'a'};
+  uint32_t dataSize = 0;
+};
+
+void writeServerWavHeader(int sampleRate, int sampleWidth, int channels,
+                          std::uint32_t dataSizeBytes,
+                          std::ostream &audioFile) {
+  PcmWavHeader header;
+  header.dataSize = dataSizeBytes;
+  header.chunkSize = header.dataSize + sizeof(PcmWavHeader) - 8;
+  header.sampleRate = static_cast<uint32_t>(sampleRate);
+  header.numChannels = static_cast<uint16_t>(channels);
+  header.bytesPerSec = static_cast<uint32_t>(sampleRate * sampleWidth * channels);
+  header.blockAlign = static_cast<uint16_t>(sampleWidth * channels);
+  header.bitsPerSample = static_cast<uint16_t>(sampleWidth * 8);
+  audioFile.write(reinterpret_cast<const char *>(&header), sizeof(header));
+}
+
+class FairTtsScheduler {
+public:
+  FairTtsScheduler(piper::PiperConfig &piperConfig, ModelCache &modelCache,
+                   const ServerOptions &options, ServerMetrics &metrics)
+      : piperConfig(piperConfig), modelCache(modelCache), options(options),
+        metrics(metrics), maxJobs(std::max<std::size_t>(1, options.maxConcurrentJobs)),
+        queueSize(std::max<std::size_t>(maxJobs, options.queueSize)),
+        workerCount(std::max<std::size_t>(1, options.chunkWorkers)) {
+    for (std::size_t i = 0; i < workerCount; ++i) {
+      workers.emplace_back([this]() { workerLoop(); });
+    }
+  }
+
+  ~FairTtsScheduler() {
+    {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      stopping = true;
+      queueCv.notify_all();
+    }
+    for (auto &worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+  }
+
+  TtsJobResult synthesize(const TtsJobRequest &request) {
+    auto job = std::make_shared<JobState>();
+    job->id = makeOutputFileName();
+    if (job->id.size() > 4 && job->id.substr(job->id.size() - 4) == ".wav") {
+      job->id.erase(job->id.size() - 4);
+    }
+    job->textChunks = piper::splitTextIntoChunks(request.text, options.maxTextChunkBytes);
+    job->fileName = request.fileName;
+    job->outputPath = request.outputPath;
+    job->requestedModel = request.requestedModel;
+    job->speakerId = request.speakerId;
+    job->shouldCancel = request.shouldCancel;
+    job->pendingChunks = job->textChunks.size();
+    job->chunkPaths.resize(job->textChunks.size());
+    job->chunkBytes.resize(job->textChunks.size(), 0);
+    job->tempDir = options.outputDir / "tmp" / job->id;
+
+    if (job->textChunks.empty()) {
+      throw std::runtime_error("missing_fields");
+    }
+
+    std::filesystem::create_directories(job->tempDir);
+
+    {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      if ((activeJobs + waitingJobs) >= queueSize) {
+        metrics.rejectedJobs++;
+        throw std::runtime_error("server_busy");
+      }
+
+      metrics.acceptedJobs++;
+      if (activeJobs < maxJobs) {
+        job->activated = true;
+        ++activeJobs;
+        activeRoundRobin.push_back(job);
+      } else {
+        ++waitingJobs;
+        pendingJobs.push_back(job);
+      }
+    }
+    queueCv.notify_all();
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(std::max<std::size_t>(1, options.queueTimeoutSeconds));
+
+    {
+      std::unique_lock<std::mutex> lock(job->mutex);
+      while (!job->done) {
+        if (request.shouldCancel && request.shouldCancel()) {
+          job->cancelled = true;
+          if (job->startedChunks == 0) {
+            job->pendingChunks = 0;
+            job->done = true;
+            job->cv.notify_all();
+          }
+          queueCv.notify_all();
+        }
+
+        if (std::chrono::steady_clock::now() > deadline && job->startedChunks == 0) {
+          job->cancelled = true;
+          job->failed = true;
+          job->error = "server_busy";
+          job->pendingChunks = 0;
+          job->done = true;
+          job->cv.notify_all();
+          queueCv.notify_all();
+        }
+
+        job->cv.wait_for(lock, std::chrono::milliseconds(100));
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(queueMutex);
+      if (job->activated) {
+        if (activeJobs > 0) {
+          --activeJobs;
+        }
+      } else if (waitingJobs > 0) {
+        --waitingJobs;
+      }
+      activatePendingJobsLocked();
+    }
+    queueCv.notify_all();
+
+    if (job->cancelled && !job->failed) {
+      cleanupJob(*job);
+      metrics.cancelledJobs++;
+      throw std::runtime_error("synthesis_cancelled");
+    }
+
+    if (job->failed) {
+      cleanupJob(*job);
+      metrics.failedJobs++;
+      throw std::runtime_error(job->error.empty() ? "synthesis_error" : job->error);
+    }
+
+    assembleWav(*job);
+    cleanupJob(*job);
+    metrics.completedJobs++;
+
+    TtsJobResult result;
+    result.fileName = job->fileName;
+    result.outputPath = job->outputPath;
+    result.modelName = job->modelName;
+    result.modelPath = job->modelPath;
+    result.chunks = job->textChunks.size();
+    result.synthesis = job->synthesis;
+    if (std::filesystem::exists(job->outputPath)) {
+      result.bytes = std::filesystem::file_size(job->outputPath);
+    }
+    return result;
+  }
+
+  std::size_t activeJobCount() const {
+    std::lock_guard<std::mutex> lock(queueMutex);
+    return activeJobs;
+  }
+
+  std::size_t waitingJobCount() const {
+    std::lock_guard<std::mutex> lock(queueMutex);
+    return waitingJobs;
+  }
+
+  std::size_t workerTotal() const { return workerCount; }
+
+private:
+  struct JobState {
+    std::string id;
+    std::string fileName;
+    std::filesystem::path outputPath;
+    std::filesystem::path tempDir;
+    std::optional<std::string> requestedModel;
+    std::optional<piper::SpeakerId> speakerId;
+    std::function<bool()> shouldCancel;
+    std::vector<std::string> textChunks;
+    std::vector<std::filesystem::path> chunkPaths;
+    std::vector<std::uintmax_t> chunkBytes;
+    std::size_t nextChunk = 0;
+    std::size_t pendingChunks = 0;
+    std::size_t startedChunks = 0;
+    std::size_t inFlightChunks = 0;
+    bool activated = false;
+    bool cancelled = false;
+    bool failed = false;
+    bool done = false;
+    std::string error;
+    std::string modelName;
+    std::filesystem::path modelPath;
+    int sampleRate = 22050;
+    int sampleWidth = 2;
+    int channels = 1;
+    piper::SynthesisResult synthesis;
+    std::mutex mutex;
+    std::condition_variable cv;
+  };
+
+  struct WorkItem {
+    std::shared_ptr<JobState> job;
+    std::size_t index = 0;
+  };
+
+  void activatePendingJobsLocked() {
+    while (activeJobs < maxJobs && !pendingJobs.empty()) {
+      auto pending = pendingJobs.front();
+      pendingJobs.pop_front();
+      if (waitingJobs > 0) {
+        --waitingJobs;
+      }
+
+      std::lock_guard<std::mutex> jobLock(pending->mutex);
+      if (pending->done || pending->cancelled || pending->failed) {
+        continue;
+      }
+
+      pending->activated = true;
+      ++activeJobs;
+      activeRoundRobin.push_back(pending);
+    }
+  }
+
+  std::optional<WorkItem> nextWork() {
+    std::unique_lock<std::mutex> lock(queueMutex);
+    queueCv.wait(lock, [this]() { return stopping || !activeRoundRobin.empty(); });
+    if (stopping) {
+      return std::nullopt;
+    }
+
+    while (!activeRoundRobin.empty()) {
+      auto job = activeRoundRobin.front();
+      activeRoundRobin.pop_front();
+
+      {
+        std::lock_guard<std::mutex> jobLock(job->mutex);
+        if (job->cancelled || job->failed || job->nextChunk >= job->textChunks.size()) {
+          continue;
+        }
+
+        const std::size_t index = job->nextChunk++;
+        ++job->startedChunks;
+        ++job->inFlightChunks;
+
+        if (job->nextChunk < job->textChunks.size()) {
+          activeRoundRobin.push_back(job);
+        }
+        return WorkItem{job, index};
+      }
+    }
+
+    return std::nullopt;
+  }
+
+  void workerLoop() {
+    while (true) {
+      auto maybeWork = nextWork();
+      if (!maybeWork) {
+        if (stopping) {
+          return;
+        }
+        continue;
+      }
+
+      metrics.processingChunks++;
+      processChunk(maybeWork->job, maybeWork->index);
+      metrics.processingChunks--;
+    }
+  }
+
+  void processChunk(const std::shared_ptr<JobState> &job, std::size_t index) {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        if (job->cancelled || job->failed) {
+          if (job->pendingChunks > job->inFlightChunks) {
+            job->pendingChunks = job->inFlightChunks;
+          }
+          markChunkFinished(*job);
+          return;
+        }
+      }
+
+      auto shouldCancel = [job]() {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        if (job->cancelled || job->failed) {
+          return true;
+        }
+        return job->shouldCancel ? job->shouldCancel() : false;
+      };
+
+      VoiceLease voiceLease = modelCache.checkout(job->requestedModel);
+      auto &selectedVoice = voiceLease.get();
+      const auto previousSpeakerId = selectedVoice.synthesisConfig.speakerId;
+      if (job->speakerId) {
+        selectedVoice.synthesisConfig.speakerId = *job->speakerId;
+      }
+
+      const auto chunkPath = job->tempDir / ("chunk_" + std::to_string(index) + ".raw");
+      std::ofstream chunkFile(chunkPath, std::ios::binary);
+      if (!chunkFile.good()) {
+        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        throw std::runtime_error("Could not open chunk temp file");
+      }
+
+      piper::SynthesisResult chunkResult;
+      std::vector<int16_t> audioBuffer;
+      std::uintmax_t bytes = 0;
+      auto audioCallback = [&]() {
+        if (audioBuffer.empty()) {
+          return;
+        }
+        const std::size_t audioBytes = sizeof(int16_t) * audioBuffer.size();
+        chunkFile.write(reinterpret_cast<const char *>(audioBuffer.data()), audioBytes);
+        bytes += audioBytes;
+      };
+
+      try {
+        piper::textToAudio(piperConfig, selectedVoice, job->textChunks[index], audioBuffer,
+                           chunkResult, audioCallback, shouldCancel);
+      } catch (...) {
+        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        throw;
+      }
+      selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+      chunkFile.close();
+
+      {
+        std::lock_guard<std::mutex> lock(job->mutex);
+        job->chunkPaths[index] = chunkPath;
+        job->chunkBytes[index] = bytes;
+        job->sampleRate = selectedVoice.synthesisConfig.sampleRate;
+        job->sampleWidth = selectedVoice.synthesisConfig.sampleWidth;
+        job->channels = selectedVoice.synthesisConfig.channels;
+        job->modelName = voiceLease.model().name;
+        job->modelPath = voiceLease.model().modelPath;
+        job->synthesis.audioSeconds += chunkResult.audioSeconds;
+        job->synthesis.inferSeconds += chunkResult.inferSeconds;
+        if (job->synthesis.audioSeconds > 0) {
+          job->synthesis.realTimeFactor = job->synthesis.inferSeconds / job->synthesis.audioSeconds;
+        }
+        metrics.completedChunks++;
+        markChunkFinished(*job);
+      }
+    } catch (const std::exception &e) {
+      std::lock_guard<std::mutex> lock(job->mutex);
+      const std::string message = e.what();
+      if (message == "synthesis_cancelled") {
+        job->cancelled = true;
+      } else {
+        job->failed = true;
+        job->error = message;
+        metrics.failedChunks++;
+      }
+      if (job->pendingChunks > job->inFlightChunks) {
+        job->pendingChunks = job->inFlightChunks;
+      }
+      markChunkFinished(*job);
+    }
+  }
+
+  void markChunkFinished(JobState &job) {
+    if (job.inFlightChunks > 0) {
+      --job.inFlightChunks;
+    }
+    if (job.pendingChunks > 0) {
+      --job.pendingChunks;
+    }
+    if (job.pendingChunks == 0 && job.inFlightChunks == 0) {
+      job.done = true;
+      job.cv.notify_all();
+    }
+  }
+
+  void assembleWav(const JobState &job) {
+    std::uint64_t totalBytes = 0;
+    for (const auto bytes : job.chunkBytes) {
+      totalBytes += bytes;
+    }
+
+    if (totalBytes > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("Generated WAV exceeds 4 GiB. Use smaller inputs or raw output.");
+    }
+
+    std::ofstream output(job.outputPath, std::ios::binary);
+    if (!output.good()) {
+      throw std::runtime_error("Could not open output file");
+    }
+
+    writeServerWavHeader(job.sampleRate, job.sampleWidth, job.channels,
+                         static_cast<std::uint32_t>(totalBytes), output);
+
+    std::array<char, 64 * 1024> buffer{};
+    for (const auto &chunkPath : job.chunkPaths) {
+      std::ifstream chunk(chunkPath, std::ios::binary);
+      if (!chunk.good()) {
+        throw std::runtime_error("Missing synthesized chunk");
+      }
+      while (chunk.good()) {
+        chunk.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = chunk.gcount();
+        if (count > 0) {
+          output.write(buffer.data(), count);
+        }
+      }
+    }
+  }
+
+  void cleanupJob(const JobState &job) {
+    std::error_code ignored;
+    std::filesystem::remove_all(job.tempDir, ignored);
+  }
+
+  piper::PiperConfig &piperConfig;
+  ModelCache &modelCache;
+  const ServerOptions &options;
+  ServerMetrics &metrics;
+  const std::size_t maxJobs;
+  const std::size_t queueSize;
+  const std::size_t workerCount;
+  mutable std::mutex queueMutex;
+  std::condition_variable queueCv;
+  std::deque<std::shared_ptr<JobState>> activeRoundRobin;
+  std::deque<std::shared_ptr<JobState>> pendingJobs;
+  std::vector<std::thread> workers;
+  bool stopping = false;
+  std::size_t activeJobs = 0;
+  std::size_t waitingJobs = 0;
+};
+
+json resourcePolicyJson(const ServerOptions &options, const FairTtsScheduler &scheduler) {
+  return json{{"mode", "auto"},
+              {"profile", options.cpuProfile},
+              {"hardware_threads", options.resourcePolicy.hardwareThreads},
+              {"cpu_threads_per_worker", options.cpuThreads.value_or(0)},
+              {"max_concurrent_jobs", options.maxConcurrentJobs},
+              {"chunk_workers", scheduler.workerTotal()},
+              {"max_model_replicas", options.maxModelReplicas},
+              {"queue_size", options.queueSize},
+              {"queue_timeout_seconds", options.queueTimeoutSeconds},
+              {"active_jobs", scheduler.activeJobCount()},
+              {"waiting_jobs", scheduler.waitingJobCount()}};
+}
+
+json metricsJson(const ServerMetrics &metrics, const FairTtsScheduler &scheduler,
+                 const ServerOptions &options) {
+  return json{{"jobs",
+               json{{"active", scheduler.activeJobCount()},
+                    {"waiting", scheduler.waitingJobCount()},
+                    {"accepted", metrics.acceptedJobs.load()},
+                    {"completed", metrics.completedJobs.load()},
+                    {"cancelled", metrics.cancelledJobs.load()},
+                    {"failed", metrics.failedJobs.load()},
+                    {"rejected", metrics.rejectedJobs.load()}}},
+              {"chunks",
+               json{{"processing", metrics.processingChunks.load()},
+                    {"completed", metrics.completedChunks.load()},
+                    {"failed", metrics.failedChunks.load()}}},
+              {"resources", resourcePolicyJson(options, scheduler)}};
+}
+
 
 int errorStatusForException(const std::string &error) {
   if (error == "invalid_model") {
@@ -767,7 +1569,7 @@ void sendFile(SocketHandle socketHandle, const std::filesystem::path &filePath) 
 
 void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
                   const ServerOptions &options, ModelCache &modelCache,
-                  JobLimiter &jobLimiter) {
+                  FairTtsScheduler &scheduler, ServerMetrics &metrics) {
   try {
     auto maybeRequest = readHttpRequest(clientSocket, options.maxInputBytes);
     if (!maybeRequest) {
@@ -776,6 +1578,7 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
     }
 
     const auto &request = *maybeRequest;
+    const auto target = parseTarget(request.path);
 
     if (request.method == "OPTIONS") {
       sendResponse(clientSocket, 200, "text/plain; charset=utf-8", "");
@@ -791,7 +1594,7 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       return;
     }
 
-    if ((request.method == "GET") && (request.path == "/api/health")) {
+    if ((request.method == "GET") && (target.path == "/api/health")) {
       sendJson(clientSocket, 200,
                successResponse("Servidor Piper activo.",
                                json{{"status", "ok"},
@@ -801,7 +1604,7 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       return;
     }
 
-    if ((request.method == "GET") && (request.path == "/api/v1/status")) {
+    if ((request.method == "GET") && (target.path == "/api/v1/status")) {
       sendJson(clientSocket, 200,
                successResponse("Estado obtenido correctamente.",
                                json{{"server", "piper"},
@@ -814,30 +1617,90 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
                                           {"header", "Authorization: Bearer <token>"}}},
                                     {"limits",
                                      json{{"max_input_bytes", options.maxInputBytes},
-                                          {"max_text_chunk_bytes",
-                                           options.maxTextChunkBytes},
-                                          {"max_concurrent_jobs",
-                                           options.maxConcurrentJobs},
-                                          {"max_model_replicas",
-                                           options.maxModelReplicas},
-                                          {"active_jobs", jobLimiter.active()}}}}));
+                                          {"max_text_chunk_bytes", options.maxTextChunkBytes}}},
+                                    {"resource_policy", resourcePolicyJson(options, scheduler)}}));
       closeSocket(clientSocket);
       return;
     }
 
-    if ((request.method == "GET") && (request.path == "/api/v1/models")) {
+    if ((request.method == "GET") && (target.path == "/api/v1/metrics")) {
+      sendJson(clientSocket, 200,
+               successResponse("Métricas obtenidas correctamente.",
+                               metricsJson(metrics, scheduler, options)));
+      closeSocket(clientSocket);
+      return;
+    }
+
+    if ((request.method == "GET") && (target.path == "/api/v1/models")) {
+      auto includeMode = queryValue(target, "include").value_or("basic");
+      includeMode = lowerCopy(includeMode);
+      if (includeMode != "basic" && includeMode != "metadata" && includeMode != "technical") {
+        sendJson(clientSocket, 400,
+                 errorResponse("invalid_request", "include debe ser basic, metadata o technical."));
+        closeSocket(clientSocket);
+        return;
+      }
+
       json models = json::array();
       for (const auto &model : scanModels(options.modelsDir)) {
-        models.push_back(modelInfoToJson(model));
+        models.push_back(modelInfoToJson(model, includeMode));
       }
       sendJson(clientSocket, 200,
                successResponse("Modelos listados correctamente.",
-                               json{{"total", models.size()}, {"models", models}}));
+                               json{{"total", models.size()},
+                                    {"include", includeMode},
+                                    {"models", models}}));
       closeSocket(clientSocket);
       return;
     }
 
-    if (auto fileName = routeFileName(request.path)) {
+    if (auto imageModelName = routeModelImageName(target.path)) {
+      if (request.method != "GET") {
+        sendJson(clientSocket, 405,
+                 errorResponse("method_not_allowed", "Método no permitido."));
+        closeSocket(clientSocket);
+        return;
+      }
+
+      if (!isSafeFileName(*imageModelName)) {
+        sendJson(clientSocket, 400,
+                 errorResponse("invalid_request", "Nombre de modelo inválido."));
+        closeSocket(clientSocket);
+        return;
+      }
+
+      try {
+        auto modelInfo = findModelByName(options, *imageModelName);
+        if (!modelInfo || !modelInfo->hasConfig) {
+          sendJson(clientSocket, 404,
+                   errorResponse("not_found", "Modelo o configuración no encontrada."));
+          closeSocket(clientSocket);
+          return;
+        }
+        auto root = loadJsonFile(modelInfo->configPath);
+        if (!modelJsonHasImage(root)) {
+          sendJson(clientSocket, 404,
+                   errorResponse("not_found", "El modelo no tiene imagen."));
+          closeSocket(clientSocket);
+          return;
+        }
+        auto [contentType, imageBytes] = parseDataImage(root["modelcard"]["image"].get<std::string>());
+        sendResponse(clientSocket, 200, contentType, imageBytes,
+                     {{"Cache-Control", "public, max-age=3600"}});
+      } catch (const std::runtime_error &e) {
+        const std::string message = e.what();
+        if (message == "invalid_image") {
+          sendJson(clientSocket, 400,
+                   errorResponse("invalid_image", "La imagen del modelo no tiene un formato válido."));
+        } else {
+          sendJson(clientSocket, 500, errorResponse("server_error", message));
+        }
+      }
+      closeSocket(clientSocket);
+      return;
+    }
+
+    if (auto fileName = routeFileName(target.path)) {
       if (request.method != "GET") {
         sendJson(clientSocket, 405,
                  errorResponse("method_not_allowed", "Método no permitido."));
@@ -858,7 +1721,7 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       return;
     }
 
-    if ((request.method == "POST") && (request.path == "/api/v1/tts")) {
+    if ((request.method == "POST") && (target.path == "/api/v1/tts")) {
       json input;
       try {
         input = json::parse(request.body);
@@ -910,51 +1773,42 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         requestedModel = input["model"].get<std::string>();
       }
 
-      JobLease jobLease(jobLimiter);
-      if (!jobLease) {
-        sendJson(clientSocket, 429, modelErrorResponse("server_busy"));
-        closeSocket(clientSocket);
-        return;
-      }
-
-      VoiceLease voiceLease;
-      try {
-        voiceLease = modelCache.checkout(requestedModel);
-      } catch (const std::runtime_error &e) {
-        const std::string message = e.what();
-        sendJson(clientSocket, errorStatusForException(message),
-                 modelErrorResponse(message));
-        closeSocket(clientSocket);
-        return;
-      }
-
-      auto &selectedVoice = voiceLease.get();
-      const auto previousSpeakerId = selectedVoice.synthesisConfig.speakerId;
+      std::optional<piper::SpeakerId> speakerId;
       if (input.contains("speaker_id") && input["speaker_id"].is_number_integer()) {
-        selectedVoice.synthesisConfig.speakerId = input["speaker_id"].get<piper::SpeakerId>();
+        speakerId = input["speaker_id"].get<piper::SpeakerId>();
       }
 
       std::filesystem::create_directories(options.outputDir);
       const auto outputPath = options.outputDir / fileName;
-      piper::SynthesisResult result;
       auto shouldCancel = [&clientSocket]() {
         return clientDisconnected(clientSocket);
       };
 
       try {
-        if (shouldCancel()) {
-          throw std::runtime_error("synthesis_cancelled");
-        }
+        TtsJobRequest jobRequest;
+        jobRequest.text = text;
+        jobRequest.fileName = fileName;
+        jobRequest.outputPath = outputPath;
+        jobRequest.requestedModel = requestedModel;
+        jobRequest.speakerId = speakerId;
+        jobRequest.shouldCancel = shouldCancel;
 
-        std::ofstream audioFile(outputPath, std::ios::binary);
-        if (!audioFile.good()) {
-          throw std::runtime_error("Could not open output file");
-        }
+        auto result = scheduler.synthesize(jobRequest);
 
-        piper::textToWavFile(piperConfig, selectedVoice, text, audioFile, result,
-                             options.maxTextChunkBytes, shouldCancel);
-      } catch (const std::exception &e) {
-        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        sendJson(clientSocket, 201,
+                 successResponse("Audio generado exitosamente.",
+                                 json{{"file", fileName},
+                                      {"model", result.modelName},
+                                      {"model_file", result.modelPath.string()},
+                                      {"path", outputPath.string()},
+                                      {"url", "/api/v1/files/" + fileName},
+                                      {"format", "wav"},
+                                      {"chunks", result.chunks},
+                                      {"bytes", result.bytes},
+                                      {"audio_seconds", result.synthesis.audioSeconds},
+                                      {"infer_seconds", result.synthesis.inferSeconds},
+                                      {"real_time_factor", result.synthesis.realTimeFactor}}));
+      } catch (const std::runtime_error &e) {
         const std::string message = e.what();
         if (message == "synthesis_cancelled") {
           spdlog::warn("TTS request cancelled because client disconnected");
@@ -966,31 +1820,15 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
 
         std::error_code ignored;
         std::filesystem::remove(outputPath, ignored);
+        sendJson(clientSocket, errorStatusForException(message),
+                 modelErrorResponse(message));
+      } catch (const std::exception &e) {
+        std::error_code ignored;
+        std::filesystem::remove(outputPath, ignored);
         sendJson(clientSocket, 500,
                  errorResponse("synthesis_error", e.what()));
-        closeSocket(clientSocket);
-        return;
       }
 
-      selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
-
-      std::uintmax_t bytes = 0;
-      if (std::filesystem::exists(outputPath)) {
-        bytes = std::filesystem::file_size(outputPath);
-      }
-
-      sendJson(clientSocket, 201,
-               successResponse("Audio generado exitosamente.",
-                               json{{"file", fileName},
-                                    {"model", voiceLease.model().name},
-                                    {"model_file", voiceLease.model().modelPath.string()},
-                                    {"path", outputPath.string()},
-                                    {"url", "/api/v1/files/" + fileName},
-                                    {"format", "wav"},
-                                    {"bytes", bytes},
-                                    {"audio_seconds", result.audioSeconds},
-                                    {"infer_seconds", result.inferSeconds},
-                                    {"real_time_factor", result.realTimeFactor}}));
       closeSocket(clientSocket);
       return;
     }
@@ -1056,7 +1894,7 @@ std::optional<ModelInfo> findFirstUsableModel(const std::filesystem::path &model
 }
 
 void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
-               const ServerOptions &options) {
+               ServerOptions options) {
   std::filesystem::create_directories(options.modelsDir);
   std::filesystem::create_directories(options.outputDir);
 
@@ -1098,6 +1936,20 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
     throw std::runtime_error("Could not listen on server socket");
   }
 
+  unsigned int hardwareThreads = std::thread::hardware_concurrency();
+  if (hardwareThreads == 0) {
+    hardwareThreads = 1;
+  }
+  options.resourcePolicy.profile = options.cpuProfile;
+  options.resourcePolicy.autoConfigured = true;
+  options.resourcePolicy.hardwareThreads = hardwareThreads;
+  options.resourcePolicy.cpuThreadsPerWorker = static_cast<std::size_t>(options.cpuThreads.value_or(1));
+  options.resourcePolicy.maxConcurrentJobs = options.maxConcurrentJobs;
+  options.resourcePolicy.chunkWorkers = options.chunkWorkers;
+  options.resourcePolicy.maxModelReplicas = options.maxModelReplicas;
+  options.resourcePolicy.queueSize = options.queueSize;
+  options.resourcePolicy.queueTimeoutSeconds = options.queueTimeoutSeconds;
+
   spdlog::info("Piper API server listening on http://{}:{}", options.host,
                options.port);
   spdlog::info("Models directory: {}", options.modelsDir.string());
@@ -1108,11 +1960,13 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
   } else {
     spdlog::info("API token authentication enabled");
   }
-  spdlog::info("Concurrent jobs limit: {}", options.maxConcurrentJobs);
-  spdlog::info("Model replicas per model: {}", options.maxModelReplicas);
+  spdlog::info("Resource policy: profile={} cpu_threads={} chunk_workers={} max_jobs={} queue_size={} replicas={}",
+               options.cpuProfile, options.cpuThreads.value_or(0), options.chunkWorkers,
+               options.maxConcurrentJobs, options.queueSize, options.maxModelReplicas);
 
   ModelCache modelCache(piperConfig, voice, options);
-  JobLimiter jobLimiter(options.maxConcurrentJobs);
+  ServerMetrics metrics;
+  FairTtsScheduler scheduler(piperConfig, modelCache, options, metrics);
 
   while (true) {
     sockaddr_in clientAddress{};
@@ -1128,7 +1982,7 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
     }
 
     std::thread(handleClient, clientSocket, std::ref(piperConfig), options,
-                std::ref(modelCache), std::ref(jobLimiter))
+                std::ref(modelCache), std::ref(scheduler), std::ref(metrics))
         .detach();
   }
 

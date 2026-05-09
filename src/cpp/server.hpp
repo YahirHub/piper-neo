@@ -18,6 +18,18 @@ struct ModelInfo {
   bool hasConfig = false;
 };
 
+struct ResourcePolicy {
+  std::string profile = "balanced";
+  bool autoConfigured = true;
+  unsigned int hardwareThreads = 1;
+  std::size_t cpuThreadsPerWorker = 1;
+  std::size_t maxConcurrentJobs = 1;
+  std::size_t chunkWorkers = 1;
+  std::size_t maxModelReplicas = 1;
+  std::size_t queueSize = 16;
+  std::size_t queueTimeoutSeconds = 60;
+};
+
 struct ServerOptions {
   std::string host = "127.0.0.1";
   int port = 8080;
@@ -30,8 +42,13 @@ struct ServerOptions {
   std::optional<int> cpuThreads;
   std::size_t maxInputBytes = 10 * 1024 * 1024;
   std::size_t maxTextChunkBytes = 4096;
-  std::size_t maxConcurrentJobs = 2;
-  std::size_t maxModelReplicas = 2;
+  std::size_t maxConcurrentJobs = 0;
+  std::size_t maxModelReplicas = 0;
+  std::size_t chunkWorkers = 0;
+  std::size_t queueSize = 0;
+  std::size_t queueTimeoutSeconds = 60;
+  std::string cpuProfile = "balanced";
+  ResourcePolicy resourcePolicy;
   std::string apiToken;
 };
 
@@ -39,7 +56,7 @@ std::vector<ModelInfo> scanModels(const std::filesystem::path &modelsDir);
 std::optional<ModelInfo> findFirstUsableModel(const std::filesystem::path &modelsDir);
 
 void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
-               const ServerOptions &options);
+               ServerOptions options);
 
 } // namespace piper_server
 
