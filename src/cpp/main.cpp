@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -121,6 +122,9 @@ struct RunConfig {
   size_t chunkWorkers = 0;
   size_t queueSize = 0;
   size_t queueTimeoutSeconds = 60;
+  size_t maxTempBytes = 1024ULL * 1024ULL * 1024ULL;
+  size_t outputRetentionSeconds = 3600;
+  size_t modelsRefreshSeconds = 30;
   string cpuProfile = "balanced";
   bool outputDirExplicit = false;
 };
@@ -153,13 +157,27 @@ int main(int argc, char *argv[]) {
                 runConfig.modelPath.string(),
                 runConfig.modelConfigPath.string());
 
+  const auto loadWallTime = chrono::system_clock::now();
+  const auto loadWallT = chrono::system_clock::to_time_t(loadWallTime);
+  std::tm loadWallTm{};
+#ifdef _WIN32
+  gmtime_s(&loadWallTm, &loadWallT);
+#else
+  gmtime_r(&loadWallT, &loadWallTm);
+#endif
+  std::ostringstream loadTimestamp;
+  loadTimestamp << std::put_time(&loadWallTm, "%Y-%m-%dT%H:%M:%SZ");
+  spdlog::info("{} Model load started: model={}", loadTimestamp.str(),
+               runConfig.modelPath.filename().string());
+
   auto startTime = chrono::steady_clock::now();
   loadVoice(piperConfig, runConfig.modelPath.string(),
             runConfig.modelConfigPath.string(), voice, runConfig.speakerId,
             runConfig.useCuda, runConfig.cpuThreads);
   auto endTime = chrono::steady_clock::now();
-  spdlog::info("Loaded voice in {} second(s)",
-               chrono::duration<double>(endTime - startTime).count());
+  spdlog::info("{} Model load finished: model={} duration_ms={}",
+               loadTimestamp.str(), runConfig.modelPath.filename().string(),
+               chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count());
 
   // Get the path to the piper executable so we can locate espeak-ng-data, etc.
   // next to it.
@@ -296,6 +314,9 @@ int main(int argc, char *argv[]) {
     serverOptions.chunkWorkers = runConfig.chunkWorkers;
     serverOptions.queueSize = runConfig.queueSize;
     serverOptions.queueTimeoutSeconds = runConfig.queueTimeoutSeconds;
+    serverOptions.maxTempBytes = runConfig.maxTempBytes;
+    serverOptions.outputRetentionSeconds = runConfig.outputRetentionSeconds;
+    serverOptions.modelsRefreshSeconds = runConfig.modelsRefreshSeconds;
     serverOptions.cpuProfile = runConfig.cpuProfile;
     serverOptions.apiToken = resolveApiToken(runConfig.apiToken).value_or("");
 
@@ -496,12 +517,6 @@ size_t clampSize(size_t value, size_t minValue, size_t maxValue) {
 }
 
 void applyAutoServerResourceConfig(RunConfig &runConfig) {
-  // Track which knobs were explicitly provided so we can auto-tune safely without
-  // surprising users who intentionally overrode values.
-  const bool cpuThreadsExplicit = runConfig.cpuThreadsExplicit;
-  const bool chunkWorkersExplicit = runConfig.chunkWorkers != 0;
-  const bool queueSizeExplicit = runConfig.queueSize != 0;
-
   unsigned int hardwareThreads = std::thread::hardware_concurrency();
   if (hardwareThreads == 0) {
     hardwareThreads = 2;
@@ -540,7 +555,7 @@ void applyAutoServerResourceConfig(RunConfig &runConfig) {
     autoQueueSize = 32;
   }
 
-  if (!cpuThreadsExplicit && !runConfig.cpuThreads) {
+  if (!runConfig.cpuThreadsExplicit && !runConfig.cpuThreads) {
     runConfig.cpuThreads = static_cast<int>(autoCpuThreads);
   }
 
@@ -563,18 +578,10 @@ void applyAutoServerResourceConfig(RunConfig &runConfig) {
   // Prevent accidental oversubscription when the user overrides only part of the policy.
   const size_t cpuThreads = static_cast<size_t>(runConfig.cpuThreads.value_or(1));
   const size_t safeWorkersByCpu = std::max<size_t>(1, hardwareThreads / std::max<size_t>(1, cpuThreads));
-
-  if (!chunkWorkersExplicit) {
-    runConfig.chunkWorkers = clampSize(runConfig.chunkWorkers, 1, safeWorkersByCpu);
-  }
-
+  runConfig.chunkWorkers = clampSize(runConfig.chunkWorkers, 1, safeWorkersByCpu);
   runConfig.maxConcurrentJobs = std::max<size_t>(1, runConfig.maxConcurrentJobs);
   runConfig.maxModelReplicas = std::max<size_t>(1, runConfig.maxModelReplicas);
-
-  // Keep queue >= active jobs unless the user explicitly wants otherwise.
-  if (!queueSizeExplicit) {
-    runConfig.queueSize = std::max(runConfig.queueSize, runConfig.maxConcurrentJobs);
-  }
+  runConfig.queueSize = std::max(runConfig.queueSize, runConfig.maxConcurrentJobs);
 
   spdlog::info("Server resource policy: profile={} hardware_threads={} cpu_threads={} max_jobs={} chunk_workers={} max_model_replicas={} queue_size={}",
                runConfig.cpuProfile, hardwareThreads, runConfig.cpuThreads.value_or(0),
@@ -773,6 +780,15 @@ void printUsage(char *argv[]) {
   cerr << "   --queue-timeout-seconds NUM   seconds a job may wait in queue "
           "(default: 60)"
        << endl;
+  cerr << "   --max-temp-bytes       NUM   max temporary RAW audio bytes "
+          "(default: 1073741824)"
+       << endl;
+  cerr << "   --output-retention-seconds NUM seconds generated API WAV files stay "
+          "available (default: 3600)"
+       << endl;
+  cerr << "   --models-refresh-seconds NUM seconds to cache /models metadata "
+          "(default: 30)"
+       << endl;
   cerr << "   --max-input-bytes       NUM   max API/direct input bytes "
           "(default: 10485760)"
        << endl;
@@ -934,6 +950,27 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
         throw runtime_error("--queue-timeout-seconds must be >= 1");
       }
       runConfig.queueTimeoutSeconds = static_cast<size_t>(timeoutSeconds);
+    } else if (arg == "--max-temp-bytes" || arg == "--max_temp_bytes") {
+      ensureArg(argc, argv, i);
+      long long tempBytes = stoll(argv[++i]);
+      if (tempBytes < 0) {
+        throw runtime_error("--max-temp-bytes must be >= 0");
+      }
+      runConfig.maxTempBytes = static_cast<size_t>(tempBytes);
+    } else if (arg == "--output-retention-seconds" || arg == "--output_retention_seconds") {
+      ensureArg(argc, argv, i);
+      long retentionSeconds = stol(argv[++i]);
+      if (retentionSeconds < 0) {
+        throw runtime_error("--output-retention-seconds must be >= 0");
+      }
+      runConfig.outputRetentionSeconds = static_cast<size_t>(retentionSeconds);
+    } else if (arg == "--models-refresh-seconds" || arg == "--models_refresh_seconds") {
+      ensureArg(argc, argv, i);
+      long refreshSeconds = stol(argv[++i]);
+      if (refreshSeconds < 1) {
+        throw runtime_error("--models-refresh-seconds must be >= 1");
+      }
+      runConfig.modelsRefreshSeconds = static_cast<size_t>(refreshSeconds);
     } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
       ensureArg(argc, argv, i);
       string cpuThreadsArg = argv[++i];
