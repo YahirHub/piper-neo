@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <cstddef>
 #include <vector>
 
 #ifdef _MSC_VER
@@ -88,6 +89,13 @@ struct RunConfig {
 
   // true to use CUDA execution provider
   bool useCuda = false;
+
+  // 0 or nullopt lets ONNX Runtime choose its default thread count.
+  optional<int> cpuThreads;
+
+  // Maximum text chunk size before phonemization/synthesis.
+  // Long inputs are split so the full WAV is not kept in memory.
+  size_t maxTextChunkBytes = 4096;
 };
 
 void parseArgs(int argc, char *argv[], RunConfig &runConfig);
@@ -118,7 +126,7 @@ int main(int argc, char *argv[]) {
   auto startTime = chrono::steady_clock::now();
   loadVoice(piperConfig, runConfig.modelPath.string(),
             runConfig.modelConfigPath.string(), voice, runConfig.speakerId,
-            runConfig.useCuda);
+            runConfig.useCuda, runConfig.cpuThreads);
   auto endTime = chrono::steady_clock::now();
   spdlog::info("Loaded voice in {} second(s)",
                chrono::duration<double>(endTime - startTime).count());
@@ -226,9 +234,28 @@ int main(int argc, char *argv[]) {
     spdlog::info("Output directory: {}", runConfig.outputPath.value().string());
   }
 
+  if ((runConfig.outputType == OUTPUT_FILE) && !runConfig.jsonInput) {
+    if (!runConfig.outputPath || runConfig.outputPath->empty()) {
+      throw runtime_error("No output path provided");
+    }
+
+    filesystem::path outputPath = runConfig.outputPath.value();
+    ofstream audioFile(outputPath.string(), ios::binary);
+    piper::SynthesisResult result;
+    piper::textToWavFileFromStream(piperConfig, voice, cin, audioFile, result,
+                                   runConfig.maxTextChunkBytes);
+    cout << outputPath.string() << endl;
+    spdlog::info("Real-time factor: {} (infer={} sec, audio={} sec)",
+                 result.realTimeFactor, result.inferSeconds,
+                 result.audioSeconds);
+
+    piper::terminate(piperConfig);
+    return EXIT_SUCCESS;
+  }
+
   string line;
-  piper::SynthesisResult result;
   while (getline(cin, line)) {
+    piper::SynthesisResult result;
     auto outputType = runConfig.outputType;
     auto speakerId = voice.synthesisConfig.speakerId;
     std::optional<filesystem::path> maybeOutputPath = runConfig.outputPath;
@@ -279,7 +306,8 @@ int main(int argc, char *argv[]) {
 
       // Output audio to automatically-named WAV file in a directory
       ofstream audioFile(outputPath.string(), ios::binary);
-      piper::textToWavFile(piperConfig, voice, line, audioFile, result);
+      piper::textToWavFile(piperConfig, voice, line, audioFile, result,
+                            runConfig.maxTextChunkBytes);
       cout << outputPath.string() << endl;
     } else if (outputType == OUTPUT_FILE) {
       if (!maybeOutputPath || maybeOutputPath->empty()) {
@@ -288,25 +316,15 @@ int main(int argc, char *argv[]) {
 
       filesystem::path outputPath = maybeOutputPath.value();
 
-      if (!runConfig.jsonInput) {
-        // Read all of standard input before synthesizing.
-        // Otherwise, we would overwrite the output file for each line.
-        stringstream text;
-        text << line;
-        while (getline(cin, line)) {
-          text << " " << line;
-        }
-
-        line = text.str();
-      }
-
       // Output audio to WAV file
       ofstream audioFile(outputPath.string(), ios::binary);
-      piper::textToWavFile(piperConfig, voice, line, audioFile, result);
+      piper::textToWavFile(piperConfig, voice, line, audioFile, result,
+                            runConfig.maxTextChunkBytes);
       cout << outputPath.string() << endl;
     } else if (outputType == OUTPUT_STDOUT) {
       // Output WAV to stdout
-      piper::textToWavFile(piperConfig, voice, line, cout, result);
+      piper::textToWavFile(piperConfig, voice, line, cout, result,
+                            runConfig.maxTextChunkBytes);
     } else if (outputType == OUTPUT_RAW) {
       // Raw output to stdout
       mutex mutAudio;
@@ -440,6 +458,11 @@ void printUsage(char *argv[]) {
        << endl;
   cerr << "   --use-cuda                    use CUDA execution provider"
        << endl;
+  cerr << "   --cpu-threads           NUM   limit ONNX Runtime CPU threads"
+       << endl;
+  cerr << "   --max-text-chunk-bytes  NUM   split long input before synthesis "
+          "(default: 4096)"
+       << endl;
   cerr << "   --debug                       print DEBUG messages to the console"
        << endl;
   cerr << "   -q       --quiet              disable logging" << endl;
@@ -525,6 +548,20 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
       runConfig.jsonInput = true;
     } else if (arg == "--use_cuda" || arg == "--use-cuda") {
       runConfig.useCuda = true;
+    } else if (arg == "--cpu_threads" || arg == "--cpu-threads") {
+      ensureArg(argc, argv, i);
+      runConfig.cpuThreads = stoi(argv[++i]);
+      if (runConfig.cpuThreads.value() < 1) {
+        throw runtime_error("--cpu-threads must be >= 1");
+      }
+    } else if (arg == "--max_text_chunk_bytes" ||
+               arg == "--max-text-chunk-bytes") {
+      ensureArg(argc, argv, i);
+      long chunkBytes = stol(argv[++i]);
+      if (chunkBytes < 512) {
+        throw runtime_error("--max-text-chunk-bytes must be >= 512");
+      }
+      runConfig.maxTextChunkBytes = static_cast<size_t>(chunkBytes);
     } else if (arg == "--version") {
       std::cout << piper::getVersion() << std::endl;
       exit(0);

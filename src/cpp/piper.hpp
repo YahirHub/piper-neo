@@ -1,6 +1,7 @@
 #ifndef PIPER_H_
 #define PIPER_H_
 
+#include <cstddef>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -85,9 +86,9 @@ struct ModelSession {
 };
 
 struct SynthesisResult {
-  double inferSeconds;
-  double audioSeconds;
-  double realTimeFactor;
+  double inferSeconds = 0.0;
+  double audioSeconds = 0.0;
+  double realTimeFactor = 0.0;
 };
 
 struct Voice {
@@ -116,16 +117,26 @@ void terminate(PiperConfig &config);
 // Load Onnx model and JSON config file
 void loadVoice(PiperConfig &config, std::string modelPath,
                std::string modelConfigPath, Voice &voice,
-               std::optional<SpeakerId> &speakerId, bool useCuda);
+               std::optional<SpeakerId> &speakerId, bool useCuda,
+               std::optional<int> cpuThreads = std::nullopt);
 
 // Phonemize text and synthesize audio
 void textToAudio(PiperConfig &config, Voice &voice, std::string text,
                  std::vector<int16_t> &audioBuffer, SynthesisResult &result,
                  const std::function<void()> &audioCallback);
 
-// Phonemize text and synthesize audio to WAV file
+// Phonemize text and synthesize audio to WAV file.
+// Audio is written progressively so large inputs do not keep the whole WAV in RAM.
 void textToWavFile(PiperConfig &config, Voice &voice, std::string text,
-                   std::ostream &audioFile, SynthesisResult &result);
+                   std::ostream &audioFile, SynthesisResult &result,
+                   std::size_t maxChunkBytes = 0);
+
+// Read text from a stream, split it into bounded chunks, and synthesize one WAV.
+// This is intended for very long stdin payloads.
+void textToWavFileFromStream(PiperConfig &config, Voice &voice,
+                             std::istream &textStream,
+                             std::ostream &audioFile, SynthesisResult &result,
+                             std::size_t maxChunkBytes);
 
 } // namespace piper
 
