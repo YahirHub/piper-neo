@@ -1,6 +1,7 @@
 #ifndef WAVFILE_H_
 #define WAVFILE_H_
 
+#include <cstdint>
 #include <iostream>
 
 struct WavHeader {
@@ -23,17 +24,24 @@ struct WavHeader {
   uint32_t dataSize;
 };
 
-// Write WAV file header only
-void writeWavHeader(int sampleRate, int sampleWidth, int channels,
-                    uint32_t numSamples, std::ostream &audioFile) {
+// Write WAV file header with an explicit byte count.
+void writeWavHeaderBytes(int sampleRate, int sampleWidth, int channels,
+                         uint32_t dataSizeBytes, std::ostream &audioFile) {
   WavHeader header;
-  header.dataSize = numSamples * sampleWidth * channels;
+  header.dataSize = dataSizeBytes;
   header.chunkSize = header.dataSize + sizeof(WavHeader) - 8;
   header.sampleRate = sampleRate;
   header.numChannels = channels;
   header.bytesPerSec = sampleRate * sampleWidth * channels;
   header.blockAlign = sampleWidth * channels;
   audioFile.write(reinterpret_cast<const char *>(&header), sizeof(header));
+}
+
+// Write WAV file header only
+void writeWavHeader(int sampleRate, int sampleWidth, int channels,
+                    uint32_t numSamples, std::ostream &audioFile) {
+  writeWavHeaderBytes(sampleRate, sampleWidth, channels,
+                      numSamples * sampleWidth * channels, audioFile);
 
 } /* writeWavHeader */
 

@@ -1,8 +1,11 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <string>
+#include <vector>
 #include <stdexcept>
 
 #include <espeak-ng/speak_lib.h>
@@ -29,6 +32,98 @@ const std::string VERSION = "";
 const float MAX_WAV_VALUE = 32767.0f;
 
 const std::string instanceName{"piper"};
+
+constexpr std::size_t DEFAULT_TEXT_CHUNK_BYTES = 4096;
+constexpr std::size_t TEXT_LOG_PREVIEW_BYTES = 256;
+
+std::string previewTextForLog(const std::string &text,
+                              std::size_t maxBytes = TEXT_LOG_PREVIEW_BYTES) {
+  if (text.size() <= maxBytes) {
+    return text;
+  }
+
+  std::size_t end = maxBytes;
+  while ((end > 0) && ((static_cast<unsigned char>(text[end]) & 0xC0) == 0x80)) {
+    --end;
+  }
+
+  if (end == 0) {
+    end = maxBytes;
+  }
+
+  std::stringstream preview;
+  preview << text.substr(0, end) << "... (" << text.size() << " byte(s))";
+  return preview.str();
+}
+
+bool isUtf8ContinuationByte(char value) {
+  return (static_cast<unsigned char>(value) & 0xC0) == 0x80;
+}
+
+std::size_t clampToUtf8Boundary(const std::string &text, std::size_t index) {
+  if (index >= text.size()) {
+    return text.size();
+  }
+
+  while ((index > 0) && isUtf8ContinuationByte(text[index])) {
+    --index;
+  }
+
+  return index;
+}
+
+std::vector<std::string> splitTextIntoChunks(const std::string &text,
+                                             std::size_t maxChunkBytes) {
+  if ((maxChunkBytes == 0) || (text.size() <= maxChunkBytes)) {
+    return {text};
+  }
+
+  std::vector<std::string> chunks;
+  std::size_t offset = 0;
+
+  while (offset < text.size()) {
+    std::size_t remaining = text.size() - offset;
+    if (remaining <= maxChunkBytes) {
+      chunks.emplace_back(text.substr(offset));
+      break;
+    }
+
+    std::size_t candidate = offset + maxChunkBytes;
+    std::size_t minBoundary = offset + (maxChunkBytes / 2);
+    std::size_t splitAt = std::string::npos;
+
+    for (std::size_t i = candidate; i > minBoundary; --i) {
+      char value = text[i - 1];
+      if ((value == '.') || (value == '!') || (value == '?') ||
+          (value == ';') || (value == ':') || (value == ',') ||
+          (value == '\n') || (value == '\r') || (value == '\t') ||
+          (value == ' ')) {
+        splitAt = i;
+        break;
+      }
+    }
+
+    if (splitAt == std::string::npos) {
+      splitAt = clampToUtf8Boundary(text, candidate);
+    }
+
+    if (splitAt <= offset) {
+      splitAt = std::min(offset + maxChunkBytes, text.size());
+      splitAt = clampToUtf8Boundary(text, splitAt);
+    }
+
+    chunks.emplace_back(text.substr(offset, splitAt - offset));
+    offset = splitAt;
+
+    while ((offset < text.size()) &&
+           ((text[offset] == ' ') || (text[offset] == '\n') ||
+            (text[offset] == '\r') || (text[offset] == '\t'))) {
+      ++offset;
+    }
+  }
+
+  return chunks;
+}
 
 std::string getVersion() { return VERSION; }
 
@@ -259,7 +354,8 @@ void terminate(PiperConfig &config) {
   spdlog::info("Terminated piper");
 }
 
-void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
+void loadModel(std::string modelPath, ModelSession &session, bool useCuda,
+               std::optional<int> cpuThreads) {
   spdlog::debug("Loading onnx model from {}", modelPath);
   session.env = Ort::Env(OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
                          instanceName.c_str());
@@ -270,6 +366,12 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
     OrtCUDAProviderOptions cuda_options{};
     cuda_options.cudnn_conv_algo_search = OrtCudnnConvAlgoSearchHeuristic;
     session.options.AppendExecutionProvider_CUDA(cuda_options);
+  }
+
+  if (cpuThreads && (cpuThreads.value() > 0)) {
+    session.options.SetIntraOpNumThreads(cpuThreads.value());
+    session.options.SetInterOpNumThreads(1);
+    spdlog::info("ONNX Runtime CPU threads limited to {}", cpuThreads.value());
   }
 
   // Slows down performance by ~2x
@@ -308,7 +410,8 @@ void loadModel(std::string modelPath, ModelSession &session, bool useCuda) {
 // Load Onnx model and JSON config file
 void loadVoice(PiperConfig &config, std::string modelPath,
                std::string modelConfigPath, Voice &voice,
-               std::optional<SpeakerId> &speakerId, bool useCuda) {
+               std::optional<SpeakerId> &speakerId, bool useCuda,
+               std::optional<int> cpuThreads) {
   spdlog::debug("Parsing voice config at {}", modelConfigPath);
   std::ifstream modelConfigFile(modelConfigPath);
   voice.configRoot = json::parse(modelConfigFile);
@@ -329,7 +432,7 @@ void loadVoice(PiperConfig &config, std::string modelPath,
 
   spdlog::debug("Voice contains {} speaker(s)", voice.modelConfig.numSpeakers);
 
-  loadModel(modelPath, voice.session, useCuda);
+  loadModel(modelPath, voice.session, useCuda, cpuThreads);
 
 } /* loadVoice */
 
@@ -417,7 +520,7 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
   }
 
   // We know the size up front
-  audioBuffer.reserve(audioCount);
+  audioBuffer.reserve(audioBuffer.size() + audioCount);
 
   // Scale audio to fill range and convert to int16
   float audioScale = (MAX_WAV_VALUE / std::max(0.01f, maxAudioValue));
@@ -459,12 +562,12 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
       throw std::runtime_error("Tashkeel model is not loaded");
     }
 
-    spdlog::debug("Diacritizing text with libtashkeel: {}", text);
+    spdlog::debug("Diacritizing text with libtashkeel: {}", previewTextForLog(text));
     text = tashkeel::tashkeel_run(text, *config.tashkeelState);
   }
 
   // Phonemes for each sentence
-  spdlog::debug("Phonemizing text: {}", text);
+  spdlog::debug("Phonemizing text: {}", previewTextForLog(text));
   std::vector<std::vector<Phoneme>> phonemes;
 
   if (voice.phonemizeConfig.phonemeType == eSpeakPhonemes) {
@@ -615,22 +718,139 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
 
 } /* textToAudio */
 
+void writeStreamingWav(PiperConfig &config, Voice &voice,
+                       const std::vector<std::string> &textChunks,
+                       std::ostream &audioFile, SynthesisResult &result) {
+  auto synthesisConfig = voice.synthesisConfig;
+  auto headerPosition = audioFile.tellp();
+  const bool isSeekable = (headerPosition != std::streampos(-1));
+  const std::uint32_t placeholderDataSize =
+      isSeekable ? 0
+                 : (std::numeric_limits<std::uint32_t>::max() -
+                    static_cast<std::uint32_t>(sizeof(WavHeader)) + 8);
+
+  // Placeholder header. It is patched with the final size for seekable streams.
+  // For stdout/pipes we use a maximum RIFF size and recommend --output_raw.
+  writeWavHeaderBytes(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
+                      synthesisConfig.channels, placeholderDataSize, audioFile);
+
+  std::uint64_t totalAudioBytes = 0;
+
+  for (const auto &textChunk : textChunks) {
+    if (textChunk.empty()) {
+      continue;
+    }
+
+    std::vector<int16_t> audioBuffer;
+    auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes]() {
+      if (audioBuffer.empty()) {
+        return;
+      }
+
+      const std::size_t audioBytes = sizeof(int16_t) * audioBuffer.size();
+      audioFile.write(reinterpret_cast<const char *>(audioBuffer.data()),
+                      audioBytes);
+      totalAudioBytes += audioBytes;
+    };
+
+    textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback);
+  }
+
+  const auto endPosition = audioFile.tellp();
+  if ((headerPosition != std::streampos(-1)) &&
+      (endPosition != std::streampos(-1))) {
+    const std::uint64_t maxWavBytes = std::numeric_limits<std::uint32_t>::max();
+    if (totalAudioBytes > maxWavBytes) {
+      throw std::runtime_error(
+          "Generated WAV exceeds 4 GiB. Use --output_raw for very large audio.");
+    }
+
+    audioFile.seekp(headerPosition);
+    writeWavHeaderBytes(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
+                        synthesisConfig.channels,
+                        static_cast<std::uint32_t>(totalAudioBytes), audioFile);
+    audioFile.seekp(endPosition);
+  } else {
+    spdlog::warn("WAV stream is not seekable; wrote a best-effort streaming WAV "
+                 "header. Use --output_raw for unbounded streaming output.");
+  }
+}
+
 // Phonemize text and synthesize audio to WAV file
 void textToWavFile(PiperConfig &config, Voice &voice, std::string text,
-                   std::ostream &audioFile, SynthesisResult &result) {
+                   std::ostream &audioFile, SynthesisResult &result,
+                   std::size_t maxChunkBytes) {
+  if (maxChunkBytes == 0) {
+    maxChunkBytes = DEFAULT_TEXT_CHUNK_BYTES;
+  }
 
-  std::vector<int16_t> audioBuffer;
-  textToAudio(config, voice, text, audioBuffer, result, NULL);
-
-  // Write WAV
-  auto synthesisConfig = voice.synthesisConfig;
-  writeWavHeader(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
-                 synthesisConfig.channels, (int32_t)audioBuffer.size(),
-                 audioFile);
-
-  audioFile.write((const char *)audioBuffer.data(),
-                  sizeof(int16_t) * audioBuffer.size());
+  auto chunks = splitTextIntoChunks(text, maxChunkBytes);
+  writeStreamingWav(config, voice, chunks, audioFile, result);
 
 } /* textToWavFile */
+
+void textToWavFileFromStream(PiperConfig &config, Voice &voice,
+                             std::istream &textStream,
+                             std::ostream &audioFile, SynthesisResult &result,
+                             std::size_t maxChunkBytes) {
+  if (maxChunkBytes == 0) {
+    maxChunkBytes = DEFAULT_TEXT_CHUNK_BYTES;
+  }
+
+  auto synthesisConfig = voice.synthesisConfig;
+  auto headerPosition = audioFile.tellp();
+  const bool isSeekable = (headerPosition != std::streampos(-1));
+  const std::uint32_t placeholderDataSize =
+      isSeekable ? 0
+                 : (std::numeric_limits<std::uint32_t>::max() -
+                    static_cast<std::uint32_t>(sizeof(WavHeader)) + 8);
+
+  writeWavHeaderBytes(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
+                      synthesisConfig.channels, placeholderDataSize, audioFile);
+
+  std::uint64_t totalAudioBytes = 0;
+  std::string line;
+  while (std::getline(textStream, line)) {
+    auto chunks = splitTextIntoChunks(line, maxChunkBytes);
+    for (const auto &textChunk : chunks) {
+      if (textChunk.empty()) {
+        continue;
+      }
+
+      std::vector<int16_t> audioBuffer;
+      auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes]() {
+        if (audioBuffer.empty()) {
+          return;
+        }
+
+        const std::size_t audioBytes = sizeof(int16_t) * audioBuffer.size();
+        audioFile.write(reinterpret_cast<const char *>(audioBuffer.data()),
+                        audioBytes);
+        totalAudioBytes += audioBytes;
+      };
+
+      textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback);
+    }
+  }
+
+  const auto endPosition = audioFile.tellp();
+  if ((headerPosition != std::streampos(-1)) &&
+      (endPosition != std::streampos(-1))) {
+    const std::uint64_t maxWavBytes = std::numeric_limits<std::uint32_t>::max();
+    if (totalAudioBytes > maxWavBytes) {
+      throw std::runtime_error(
+          "Generated WAV exceeds 4 GiB. Use --output_raw for very large audio.");
+    }
+
+    audioFile.seekp(headerPosition);
+    writeWavHeaderBytes(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
+                        synthesisConfig.channels,
+                        static_cast<std::uint32_t>(totalAudioBytes), audioFile);
+    audioFile.seekp(endPosition);
+  } else {
+    spdlog::warn("WAV stream is not seekable; wrote a best-effort streaming WAV "
+                 "header. Use --output_raw for unbounded streaming output.");
+  }
+}
 
 } // namespace piper
