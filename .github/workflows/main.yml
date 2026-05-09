@@ -3,74 +3,44 @@ name: main
 on:
   workflow_dispatch:
   push:
+    branches:
+      - master
     tags:
       - "*"
 
+permissions:
+  contents: write
+
 jobs:
-  create_release:
-    name: Create release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-    steps:
-      - name: Create release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: ${{ github.ref }}
-          draft: false
-          prerelease: false
   build_linux:
     name: "linux build"
     runs-on: ubuntu-latest
-    needs: create_release  # we need to know the upload URL
     steps:
-      - uses: actions/checkout@v3
-      - uses: docker/setup-qemu-action@v2
-      - uses: docker/setup-buildx-action@v2
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
       - name: build
         run: |
           docker buildx build . --platform linux/amd64,linux/arm64,linux/arm/v7 --output 'type=local,dest=dist'
-      - name: upload-amd64
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: dist/linux_amd64/piper_amd64.tar.gz
-          asset_name: piper_linux_x86_64.tar.gz
-          asset_content_type: application/octet-stream
-      - name: upload-arm64
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: dist/linux_arm64/piper_arm64.tar.gz
-          asset_name: piper_linux_aarch64.tar.gz
-          asset_content_type: application/octet-stream
-      - name: upload-armv7
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: dist/linux_arm_v7/piper_armv7.tar.gz
-          asset_name: piper_linux_armv7l.tar.gz
-          asset_content_type: application/octet-stream
+          name: piper-linux
+          path: |
+            dist/linux_amd64/piper_amd64.tar.gz
+            dist/linux_arm64/piper_arm64.tar.gz
+            dist/linux_arm_v7/piper_armv7.tar.gz
+          if-no-files-found: error
+
   build_windows:
     runs-on: windows-latest
     name: "windows build: ${{ matrix.arch }}"
-    needs: create_release # we need to know the upload URL
     strategy:
       fail-fast: true
       matrix:
         arch: [x64]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: configure
         run: |
           cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
@@ -84,25 +54,22 @@ jobs:
         run: |
           cd _install
           Compress-Archive -LiteralPath piper -DestinationPath piper_windows_amd64.zip
-      - name: upload
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: _install/piper_windows_amd64.zip
-          asset_name: piper_windows_amd64.zip
-          asset_content_type: application/zip
+          name: piper-windows-amd64
+          path: _install/piper_windows_amd64.zip
+          if-no-files-found: error
+
   build_macos:
     name: "macos build: ${{ matrix.arch }}"
     runs-on: macos-latest
-    needs: create_release # we need to know the upload URL
     strategy:
       fail-fast: true
       matrix:
         arch: [x64, aarch64]
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: configure
         run: |
           cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
@@ -114,14 +81,39 @@ jobs:
           cmake --install build
       - name: package
         run: |
-          cd _install && \
+          cd _install
           tar -czf piper_macos_${{ matrix.arch }}.tar.gz piper/
-      - name: upload
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ needs.create_release.outputs.upload_url }}
-          asset_path: _install/piper_macos_${{ matrix.arch }}.tar.gz
-          asset_name: piper_macos_${{ matrix.arch }}.tar.gz
-          asset_content_type: application/octet-stream
+          name: piper-macos-${{ matrix.arch }}
+          path: _install/piper_macos_${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build_linux
+      - build_windows
+      - build_macos
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Normalize asset names
+        run: |
+          mkdir -p release-upload
+          cp release-assets/piper-linux/linux_amd64/piper_amd64.tar.gz release-upload/piper_linux_x86_64.tar.gz
+          cp release-assets/piper-linux/linux_arm64/piper_arm64.tar.gz release-upload/piper_linux_aarch64.tar.gz
+          cp release-assets/piper-linux/linux_arm_v7/piper_armv7.tar.gz release-upload/piper_linux_armv7l.tar.gz
+          cp release-assets/piper-windows-amd64/piper_windows_amd64.zip release-upload/piper_windows_amd64.zip
+          cp release-assets/piper-macos-x64/piper_macos_x64.tar.gz release-upload/piper_macos_x64.tar.gz
+          cp release-assets/piper-macos-aarch64/piper_macos_aarch64.tar.gz release-upload/piper_macos_aarch64.tar.gz
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-upload/* --title "${GITHUB_REF_NAME}" --notes "Release ${GITHUB_REF_NAME}"
