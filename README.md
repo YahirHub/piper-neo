@@ -12,6 +12,9 @@ Fork de mantenimiento de Piper enfocado en uso estable con textos largos, españ
 - Límite de CPU con `--cpu-threads`.
 - Modo API local con `--server`.
 - Carpeta de modelos configurable con `--models`.
+- Selección de modelo por petición con `model`.
+- Token opcional por `.env`/variable de entorno.
+- Solicitudes paralelas controladas con `--max-concurrent-jobs` y `--max-model-replicas`.
 
 ## CLI rápido
 
@@ -26,13 +29,13 @@ Fork de mantenimiento de Piper enfocado en uso estable con textos largos, españ
 ## API rápido
 
 ```bash
-./piper --server --models models --host 127.0.0.1 --port 8080 --cpu-threads 2
+./piper --server --models models --host 127.0.0.1 --port 8080 --cpu-threads 2 --max-concurrent-jobs 2
 ```
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/tts \
   -H "Content-Type: application/json" \
-  -d '{"text":"Hola México, ¿cómo estás? ñ á é í ó ú","output_file":"demo.wav"}'
+  -d '{"model":"es_MX-voice.onnx","text":"Hola México, ¿cómo estás? ñ á é í ó ú","output_file":"demo.wav"}'
 ```
 
 ## Documentación

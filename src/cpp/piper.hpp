@@ -123,20 +123,23 @@ void loadVoice(PiperConfig &config, std::string modelPath,
 // Phonemize text and synthesize audio
 void textToAudio(PiperConfig &config, Voice &voice, std::string text,
                  std::vector<int16_t> &audioBuffer, SynthesisResult &result,
-                 const std::function<void()> &audioCallback);
+                 const std::function<void()> &audioCallback,
+                 const std::function<bool()> &shouldCancel = nullptr);
 
 // Phonemize text and synthesize audio to WAV file.
 // Audio is written progressively so large inputs do not keep the whole WAV in RAM.
 void textToWavFile(PiperConfig &config, Voice &voice, std::string text,
                    std::ostream &audioFile, SynthesisResult &result,
-                   std::size_t maxChunkBytes = 0);
+                   std::size_t maxChunkBytes = 0,
+                   const std::function<bool()> &shouldCancel = nullptr);
 
 // Read text from a stream, split it into bounded chunks, and synthesize one WAV.
 // This is intended for very long stdin payloads.
 void textToWavFileFromStream(PiperConfig &config, Voice &voice,
                              std::istream &textStream,
                              std::ostream &audioFile, SynthesisResult &result,
-                             std::size_t maxChunkBytes);
+                             std::size_t maxChunkBytes,
+                             const std::function<bool()> &shouldCancel = nullptr);
 
 } // namespace piper
 

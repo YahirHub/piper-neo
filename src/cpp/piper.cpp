@@ -37,6 +37,12 @@ const std::string instanceName{"piper"};
 constexpr std::size_t DEFAULT_TEXT_CHUNK_BYTES = 4096;
 constexpr std::size_t TEXT_LOG_PREVIEW_BYTES = 256;
 
+void throwIfSynthesisCancelled(const std::function<bool()> &shouldCancel) {
+  if (shouldCancel && shouldCancel()) {
+    throw std::runtime_error("synthesis_cancelled");
+  }
+}
+
 std::string previewTextForLog(const std::string &text,
                               std::size_t maxBytes = TEXT_LOG_PREVIEW_BYTES) {
   if (text.size() <= maxBytes) {
@@ -810,7 +816,10 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
 // Phonemize text and synthesize audio
 void textToAudio(PiperConfig &config, Voice &voice, std::string text,
                  std::vector<int16_t> &audioBuffer, SynthesisResult &result,
-                 const std::function<void()> &audioCallback) {
+                 const std::function<void()> &audioCallback,
+                 const std::function<bool()> &shouldCancel) {
+
+  throwIfSynthesisCancelled(shouldCancel);
 
   std::size_t sentenceSilenceSamples = 0;
   if (voice.synthesisConfig.sentenceSilenceSeconds > 0) {
@@ -827,6 +836,8 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
     spdlog::debug("Diacritizing text with libtashkeel: {}", previewTextForLog(text));
     text = tashkeel::tashkeel_run(text, *config.tashkeelState);
   }
+
+  throwIfSynthesisCancelled(shouldCancel);
 
   // Phonemes for each sentence
   spdlog::debug("Phonemizing text: {}", previewTextForLog(text));
@@ -848,6 +859,7 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
   std::map<Phoneme, std::size_t> missingPhonemes;
   for (auto phonemesIter = phonemes.begin(); phonemesIter != phonemes.end();
        ++phonemesIter) {
+    throwIfSynthesisCancelled(shouldCancel);
     std::vector<Phoneme> &sentencePhonemes = *phonemesIter;
 
     if (spdlog::should_log(spdlog::level::debug)) {
@@ -912,6 +924,7 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
 
     // phonemes -> ids -> audio
     for (size_t phraseIdx = 0; phraseIdx < phrasePhonemes.size(); phraseIdx++) {
+      throwIfSynthesisCancelled(shouldCancel);
       if (phrasePhonemes[phraseIdx]->size() <= 0) {
         continue;
       }
@@ -934,6 +947,7 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
       // ids -> audio
       synthesize(phonemeIds, voice.synthesisConfig, voice.session, audioBuffer,
                  phraseResults[phraseIdx]);
+      throwIfSynthesisCancelled(shouldCancel);
 
       // Add end of phrase silence
       for (std::size_t i = 0; i < phraseSilenceSamples[phraseIdx]; i++) {
@@ -952,6 +966,8 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
         audioBuffer.push_back(0);
       }
     }
+
+    throwIfSynthesisCancelled(shouldCancel);
 
     if (audioCallback) {
       // Call back must copy audio since it is cleared afterwards.
@@ -982,7 +998,8 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
 
 void writeStreamingWav(PiperConfig &config, Voice &voice,
                        const std::vector<std::string> &textChunks,
-                       std::ostream &audioFile, SynthesisResult &result) {
+                       std::ostream &audioFile, SynthesisResult &result,
+                       const std::function<bool()> &shouldCancel) {
   auto synthesisConfig = voice.synthesisConfig;
   auto headerPosition = audioFile.tellp();
   const bool isSeekable = (headerPosition != std::streampos(-1));
@@ -999,12 +1016,14 @@ void writeStreamingWav(PiperConfig &config, Voice &voice,
   std::uint64_t totalAudioBytes = 0;
 
   for (const auto &textChunk : textChunks) {
+    throwIfSynthesisCancelled(shouldCancel);
     if (textChunk.empty()) {
       continue;
     }
 
     std::vector<int16_t> audioBuffer;
-    auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes]() {
+    auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes, &shouldCancel]() {
+      throwIfSynthesisCancelled(shouldCancel);
       if (audioBuffer.empty()) {
         return;
       }
@@ -1015,7 +1034,8 @@ void writeStreamingWav(PiperConfig &config, Voice &voice,
       totalAudioBytes += audioBytes;
     };
 
-    textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback);
+    textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback,
+                shouldCancel);
   }
 
   const auto endPosition = audioFile.tellp();
@@ -1041,20 +1061,23 @@ void writeStreamingWav(PiperConfig &config, Voice &voice,
 // Phonemize text and synthesize audio to WAV file
 void textToWavFile(PiperConfig &config, Voice &voice, std::string text,
                    std::ostream &audioFile, SynthesisResult &result,
-                   std::size_t maxChunkBytes) {
+                   std::size_t maxChunkBytes,
+                   const std::function<bool()> &shouldCancel) {
   if (maxChunkBytes == 0) {
     maxChunkBytes = DEFAULT_TEXT_CHUNK_BYTES;
   }
 
+  throwIfSynthesisCancelled(shouldCancel);
   auto chunks = splitTextIntoChunks(text, maxChunkBytes);
-  writeStreamingWav(config, voice, chunks, audioFile, result);
+  writeStreamingWav(config, voice, chunks, audioFile, result, shouldCancel);
 
 } /* textToWavFile */
 
 void textToWavFileFromStream(PiperConfig &config, Voice &voice,
                              std::istream &textStream,
                              std::ostream &audioFile, SynthesisResult &result,
-                             std::size_t maxChunkBytes) {
+                             std::size_t maxChunkBytes,
+                             const std::function<bool()> &shouldCancel) {
   if (maxChunkBytes == 0) {
     maxChunkBytes = DEFAULT_TEXT_CHUNK_BYTES;
   }
@@ -1070,15 +1093,17 @@ void textToWavFileFromStream(PiperConfig &config, Voice &voice,
   writeWavHeaderBytes(synthesisConfig.sampleRate, synthesisConfig.sampleWidth,
                       synthesisConfig.channels, placeholderDataSize, audioFile);
 
-  auto synthesizeChunk = [&config, &voice, &audioFile, &result](
+  auto synthesizeChunk = [&config, &voice, &audioFile, &result, &shouldCancel](
                              const std::string &textChunk,
                              std::uint64_t &totalAudioBytes) {
+    throwIfSynthesisCancelled(shouldCancel);
     if (textChunk.empty()) {
       return;
     }
 
     std::vector<int16_t> audioBuffer;
-    auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes]() {
+    auto audioCallback = [&audioFile, &audioBuffer, &totalAudioBytes, &shouldCancel]() {
+      throwIfSynthesisCancelled(shouldCancel);
       if (audioBuffer.empty()) {
         return;
       }
@@ -1089,7 +1114,8 @@ void textToWavFileFromStream(PiperConfig &config, Voice &voice,
       totalAudioBytes += audioBytes;
     };
 
-    textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback);
+    textToAudio(config, voice, textChunk, audioBuffer, result, audioCallback,
+                shouldCancel);
   };
 
   std::uint64_t totalAudioBytes = 0;
@@ -1098,6 +1124,7 @@ void textToWavFileFromStream(PiperConfig &config, Voice &voice,
   bool firstLine = true;
 
   while (std::getline(textStream, line)) {
+    throwIfSynthesisCancelled(shouldCancel);
     if (firstLine) {
       firstLine = false;
       if (startsWithBytes(line, 0, {0xEF, 0xBB, 0xBF})) {
@@ -1121,6 +1148,7 @@ void textToWavFileFromStream(PiperConfig &config, Voice &voice,
       std::size_t consumedBytes = 0;
 
       for (std::size_t i = 0; i < chunksToSynthesize; ++i) {
+        throwIfSynthesisCancelled(shouldCancel);
         synthesizeChunk(chunks[i], totalAudioBytes);
         consumedBytes += chunks[i].size();
       }

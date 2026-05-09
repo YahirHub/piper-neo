@@ -24,8 +24,15 @@ struct ServerOptions {
   std::filesystem::path modelsDir = "models";
   std::filesystem::path outputDir = "outputs";
   std::filesystem::path activeModelPath;
+  std::filesystem::path activeModelConfigPath;
+  std::optional<piper::SpeakerId> defaultSpeakerId;
+  bool useCuda = false;
+  std::optional<int> cpuThreads;
   std::size_t maxInputBytes = 10 * 1024 * 1024;
   std::size_t maxTextChunkBytes = 4096;
+  std::size_t maxConcurrentJobs = 2;
+  std::size_t maxModelReplicas = 2;
+  std::string apiToken;
 };
 
 std::vector<ModelInfo> scanModels(const std::filesystem::path &modelsDir);

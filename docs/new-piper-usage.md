@@ -92,7 +92,7 @@ Y prefiere mantenerlo como:
 ## Modo servidor
 
 ```bash
-./piper --server --models models --host 127.0.0.1 --port 8080
+./piper --server --models models --host 127.0.0.1 --port 8080 --max-concurrent-jobs 2 --max-model-replicas 2
 ```
 
 Ver documentación completa:
@@ -100,6 +100,48 @@ Ver documentación completa:
 ```txt
 docs/api-server.md
 ```
+
+
+## Modo servidor con token
+
+Puedes proteger el servidor sin login usando un token fijo en `.env`, variable de entorno o argumento.
+
+`.env`:
+
+```env
+PIPER_API_TOKEN=mi-token-largo-y-seguro
+```
+
+Servidor:
+
+```bash
+./piper --server --models models --host 127.0.0.1 --port 8080
+```
+
+Petición:
+
+```bash
+curl http://127.0.0.1:8080/api/v1/status \
+  -H "Authorization: Bearer mi-token-largo-y-seguro"
+```
+
+También puedes pasarlo directo:
+
+```bash
+./piper --server --models models --api-token "mi-token-largo-y-seguro"
+```
+
+## Seleccionar modelo por petición API
+
+Si tienes varios modelos dentro de `models/`, puedes indicar cuál usar en cada petición:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"model":"es_MX-Veritasium.onnx","text":"Hola, ¿cómo estás?","output_file":"veritasium.wav"}'
+```
+
+El campo `model` debe ser solo el nombre del archivo `.onnx`, sin rutas. El servidor usa exactamente ese modelo y su archivo `.onnx.json` correspondiente.
 
 ## Flags nuevos
 
@@ -111,6 +153,9 @@ docs/api-server.md
 | `--host` | IP de escucha del servidor. Default: `127.0.0.1`. |
 | `--port` | Puerto del servidor. Default: `8080`. |
 | `--models` | Carpeta de modelos. Default: `models/`. |
+| `--api-token` | Token fijo para proteger el servidor API. También puede venir de `PIPER_API_TOKEN` o `.env`. Si no se define, no se pide token. |
+| `--max-concurrent-jobs` | Máximo de TTS simultáneos en API. Default: `2`. |
+| `--max-model-replicas` | Máximo de réplicas ONNX por modelo para paralelismo del mismo modelo. Default: `2`. |
 | `--max-input-bytes` | Límite de entrada directa/API. Default: `10485760`. |
 | `--max-text-chunk-bytes` | Tamaño preferido de chunks inteligentes. Default: `4096`. |
 
