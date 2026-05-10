@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -7,9 +8,11 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -30,6 +33,11 @@
 
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+#endif
+
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
 #endif
 
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -123,10 +131,13 @@ struct RunConfig {
   size_t chunkWorkers = 0;
   size_t queueSize = 0;
   size_t queueTimeoutSeconds = 60;
-  size_t maxTempBytes = 1024ULL * 1024ULL * 1024ULL;
+  size_t maxTempBytes = 0;
+  bool maxTempBytesExplicit = false;
   size_t outputRetentionSeconds = 3600;
   size_t modelsRefreshSeconds = 30;
-  string cpuProfile = "balanced";
+  string cpuProfile = "auto";
+  unsigned int detectedHardwareThreads = 0;
+  uint64_t detectedMemoryBytes = 0;
   bool outputDirExplicit = false;
 
   // Piper Neo package export (.neo)
@@ -374,6 +385,8 @@ int piperMain(int argc, char *argv[]) {
     serverOptions.outputRetentionSeconds = runConfig.outputRetentionSeconds;
     serverOptions.modelsRefreshSeconds = runConfig.modelsRefreshSeconds;
     serverOptions.cpuProfile = runConfig.cpuProfile;
+    serverOptions.detectedHardwareThreads = runConfig.detectedHardwareThreads;
+    serverOptions.detectedMemoryBytes = runConfig.detectedMemoryBytes;
     serverOptions.apiToken = resolveApiToken(runConfig.apiToken).value_or("");
 
     piper_server::runServer(piperConfig, voice, serverOptions);
@@ -572,11 +585,193 @@ size_t clampSize(size_t value, size_t minValue, size_t maxValue) {
   return std::max(minValue, std::min(value, maxValue));
 }
 
-void applyAutoServerResourceConfig(RunConfig &runConfig) {
-  unsigned int hardwareThreads = std::thread::hardware_concurrency();
-  if (hardwareThreads == 0) {
-    hardwareThreads = 2;
+uint64_t clampU64(uint64_t value, uint64_t minValue, uint64_t maxValue) {
+  return std::max(minValue, std::min(value, maxValue));
+}
+
+optional<string> readTextFileQuiet(const filesystem::path &path) {
+  ifstream file(path);
+  if (!file.good()) {
+    return nullopt;
   }
+
+  string value;
+  getline(file, value);
+  return value;
+}
+
+optional<uint64_t> parseUnsignedQuiet(const string &value) {
+  try {
+    size_t pos = 0;
+    auto parsed = stoull(value, &pos);
+    if (pos == 0) {
+      return nullopt;
+    }
+    return parsed;
+  } catch (...) {
+    return nullopt;
+  }
+}
+
+optional<unsigned int> detectCgroupCpuQuota() {
+#ifdef __linux__
+  // cgroup v2: "max 100000" means unlimited; "200000 100000" means 2 CPUs.
+  if (auto cpuMax = readTextFileQuiet("/sys/fs/cgroup/cpu.max")) {
+    istringstream stream(*cpuMax);
+    string quotaText;
+    string periodText;
+    stream >> quotaText >> periodText;
+    if (!quotaText.empty() && quotaText != "max" && !periodText.empty()) {
+      auto quota = parseUnsignedQuiet(quotaText);
+      auto period = parseUnsignedQuiet(periodText);
+      if (quota && period && *period > 0) {
+        return static_cast<unsigned int>(std::max<uint64_t>(1, (*quota + *period - 1) / *period));
+      }
+    }
+  }
+
+  // cgroup v1 fallback.
+  auto quotaText = readTextFileQuiet("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");
+  auto periodText = readTextFileQuiet("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+  if (quotaText && periodText) {
+    try {
+      long long quota = stoll(*quotaText);
+      long long period = stoll(*periodText);
+      if (quota > 0 && period > 0) {
+        return static_cast<unsigned int>(std::max<long long>(1, (quota + period - 1) / period));
+      }
+    } catch (...) {
+    }
+  }
+#endif
+
+  return nullopt;
+}
+
+optional<unsigned int> detectAffinityCpuCount() {
+#ifdef __linux__
+  cpu_set_t cpuSet;
+  CPU_ZERO(&cpuSet);
+  if (sched_getaffinity(0, sizeof(cpuSet), &cpuSet) == 0) {
+    const int count = CPU_COUNT(&cpuSet);
+    if (count > 0) {
+      return static_cast<unsigned int>(count);
+    }
+  }
+#endif
+
+  return nullopt;
+}
+
+unsigned int detectAvailableHardwareThreads() {
+  unsigned int detected = std::thread::hardware_concurrency();
+  if (detected == 0) {
+    detected = 2;
+  }
+
+  if (auto affinity = detectAffinityCpuCount()) {
+    detected = std::min(detected, *affinity);
+  }
+
+  if (auto cgroupQuota = detectCgroupCpuQuota()) {
+    detected = std::min(detected, *cgroupQuota);
+  }
+
+  return std::max(1u, detected);
+}
+
+optional<uint64_t> detectCgroupMemoryLimitBytes() {
+#ifdef __linux__
+  constexpr uint64_t unreasonableLimit = 1ULL << 60;
+
+  // cgroup v2.
+  if (auto memoryMax = readTextFileQuiet("/sys/fs/cgroup/memory.max")) {
+    if (*memoryMax != "max") {
+      if (auto parsed = parseUnsignedQuiet(*memoryMax)) {
+        if (*parsed > 0 && *parsed < unreasonableLimit) {
+          return parsed;
+        }
+      }
+    }
+  }
+
+  // cgroup v1 fallback.
+  if (auto memoryLimit = readTextFileQuiet("/sys/fs/cgroup/memory/memory.limit_in_bytes")) {
+    if (auto parsed = parseUnsignedQuiet(*memoryLimit)) {
+      if (*parsed > 0 && *parsed < unreasonableLimit) {
+        return parsed;
+      }
+    }
+  }
+#endif
+
+  return nullopt;
+}
+
+uint64_t detectAvailableMemoryBytes() {
+  uint64_t detected = 0;
+
+#ifdef __linux__
+  const long pages = sysconf(_SC_PHYS_PAGES);
+  const long pageSize = sysconf(_SC_PAGE_SIZE);
+  if (pages > 0 && pageSize > 0) {
+    detected = static_cast<uint64_t>(pages) * static_cast<uint64_t>(pageSize);
+  }
+#endif
+
+  if (auto cgroupLimit = detectCgroupMemoryLimitBytes()) {
+    detected = detected == 0 ? *cgroupLimit : std::min(detected, *cgroupLimit);
+  }
+
+  return detected;
+}
+
+size_t autoTempBudgetBytes(uint64_t memoryBytes) {
+  constexpr uint64_t MiB = 1024ULL * 1024ULL;
+  constexpr uint64_t GiB = 1024ULL * MiB;
+
+  if (memoryBytes == 0) {
+    return static_cast<size_t>(4ULL * GiB);
+  }
+
+  if (memoryBytes < 1024ULL * MiB) {
+    return static_cast<size_t>(clampU64(memoryBytes / 8, 128ULL * MiB, 256ULL * MiB));
+  }
+
+  if (memoryBytes < 4ULL * GiB) {
+    return static_cast<size_t>(clampU64(memoryBytes / 6, 256ULL * MiB, 768ULL * MiB));
+  }
+
+  return static_cast<size_t>(clampU64(memoryBytes / 4, 1ULL * GiB, 16ULL * GiB));
+}
+
+size_t memoryAwareReplicaCap(uint64_t memoryBytes, size_t requestedCap) {
+  if (memoryBytes == 0) {
+    return requestedCap;
+  }
+
+  constexpr uint64_t GiB = 1024ULL * 1024ULL * 1024ULL;
+  size_t memoryCap = 1;
+  if (memoryBytes >= 32ULL * GiB) {
+    memoryCap = 8;
+  } else if (memoryBytes >= 16ULL * GiB) {
+    memoryCap = 6;
+  } else if (memoryBytes >= 8ULL * GiB) {
+    memoryCap = 4;
+  } else if (memoryBytes >= 4ULL * GiB) {
+    memoryCap = 3;
+  } else if (memoryBytes >= 2ULL * GiB) {
+    memoryCap = 2;
+  }
+
+  return std::max<size_t>(1, std::min(requestedCap, memoryCap));
+}
+
+void applyAutoServerResourceConfig(RunConfig &runConfig) {
+  const unsigned int hardwareThreads = detectAvailableHardwareThreads();
+  const uint64_t memoryBytes = detectAvailableMemoryBytes();
+  runConfig.detectedHardwareThreads = hardwareThreads;
+  runConfig.detectedMemoryBytes = memoryBytes;
 
   size_t autoCpuThreads = 1;
   size_t autoMaxJobs = 1;
@@ -590,26 +785,35 @@ void applyAutoServerResourceConfig(RunConfig &runConfig) {
     autoChunkWorkers = autoMaxJobs;
     autoReplicas = 1;
     autoQueueSize = 16;
-  } else if (runConfig.cpuProfile == "fast") {
-    autoCpuThreads = hardwareThreads >= 8 ? 3 : (hardwareThreads >= 4 ? 2 : 1);
-    autoMaxJobs = hardwareThreads >= 12 ? 5 : (hardwareThreads >= 8 ? 4 : 2);
-    autoChunkWorkers = hardwareThreads >= 12 ? 5 : (hardwareThreads >= 8 ? 4 : 2);
-    autoReplicas = hardwareThreads >= 12 ? 3 : 2;
-    autoQueueSize = 48;
-  } else if (runConfig.cpuProfile == "max") {
-    autoCpuThreads = std::max<size_t>(1, hardwareThreads / 2);
-    autoMaxJobs = hardwareThreads >= 16 ? 6 : (hardwareThreads >= 8 ? 4 : 2);
-    autoChunkWorkers = autoMaxJobs;
-    autoReplicas = hardwareThreads >= 16 ? 4 : (hardwareThreads >= 8 ? 3 : 2);
-    autoQueueSize = 64;
-  } else {
-    // balanced
+  } else if (runConfig.cpuProfile == "balanced") {
     autoCpuThreads = hardwareThreads >= 6 ? 2 : 1;
-    autoMaxJobs = hardwareThreads >= 12 ? 4 : (hardwareThreads >= 6 ? 3 : (hardwareThreads >= 4 ? 2 : 1));
-    autoChunkWorkers = autoMaxJobs;
+    autoChunkWorkers = hardwareThreads >= 12 ? 4 : (hardwareThreads >= 6 ? 3 : (hardwareThreads >= 4 ? 2 : 1));
+    autoMaxJobs = autoChunkWorkers;
     autoReplicas = hardwareThreads >= 12 ? 3 : (hardwareThreads >= 6 ? 2 : 1);
     autoQueueSize = 32;
+  } else if (runConfig.cpuProfile == "fast") {
+    autoCpuThreads = hardwareThreads >= 16 ? 3 : (hardwareThreads >= 4 ? 2 : 1);
+    autoChunkWorkers = std::max<size_t>(1, hardwareThreads / autoCpuThreads);
+    autoMaxJobs = std::min<size_t>(std::max<size_t>(2, autoChunkWorkers * 2), 16);
+    autoReplicas = std::min<size_t>(autoMaxJobs, hardwareThreads >= 16 ? 5 : (hardwareThreads >= 8 ? 4 : 2));
+    autoQueueSize = 64;
+  } else if (runConfig.cpuProfile == "max") {
+    autoCpuThreads = hardwareThreads >= 32 ? 4 : (hardwareThreads >= 12 ? 3 : (hardwareThreads >= 4 ? 2 : 1));
+    autoChunkWorkers = std::max<size_t>(1, hardwareThreads / autoCpuThreads);
+    autoMaxJobs = std::min<size_t>(std::max<size_t>(2, autoChunkWorkers * 2), 32);
+    autoReplicas = std::min<size_t>(autoMaxJobs, std::max<size_t>(2, hardwareThreads / 2));
+    autoQueueSize = 96;
+  } else {
+    // auto: default profile. Saturates the CPU budget exposed by the OS/container
+    // while keeping per-worker ONNX threads and model replicas bounded by RAM.
+    autoCpuThreads = hardwareThreads >= 32 ? 4 : (hardwareThreads >= 12 ? 3 : (hardwareThreads >= 4 ? 2 : 1));
+    autoChunkWorkers = std::max<size_t>(1, hardwareThreads / autoCpuThreads);
+    autoMaxJobs = std::min<size_t>(std::max<size_t>(1, autoChunkWorkers * 2), 24);
+    autoReplicas = std::min<size_t>(autoMaxJobs, std::max<size_t>(1, hardwareThreads / std::max<size_t>(1, autoCpuThreads)));
+    autoQueueSize = std::max<size_t>(64, autoMaxJobs * 4);
   }
+
+  autoReplicas = memoryAwareReplicaCap(memoryBytes, autoReplicas);
 
   if (!runConfig.cpuThreadsExplicit && !runConfig.cpuThreads) {
     runConfig.cpuThreads = static_cast<int>(autoCpuThreads);
@@ -631,18 +835,24 @@ void applyAutoServerResourceConfig(RunConfig &runConfig) {
     runConfig.queueSize = std::max<size_t>(autoQueueSize, runConfig.maxConcurrentJobs);
   }
 
+  if (!runConfig.maxTempBytesExplicit) {
+    runConfig.maxTempBytes = autoTempBudgetBytes(memoryBytes);
+  }
+
   // Prevent accidental oversubscription when the user overrides only part of the policy.
-  const size_t cpuThreads = static_cast<size_t>(runConfig.cpuThreads.value_or(1));
+  const size_t cpuThreads = static_cast<size_t>(runConfig.cpuThreads.value_or(autoCpuThreads));
   const size_t safeWorkersByCpu = std::max<size_t>(1, hardwareThreads / std::max<size_t>(1, cpuThreads));
   runConfig.chunkWorkers = clampSize(runConfig.chunkWorkers, 1, safeWorkersByCpu);
   runConfig.maxConcurrentJobs = std::max<size_t>(1, runConfig.maxConcurrentJobs);
-  runConfig.maxModelReplicas = std::max<size_t>(1, runConfig.maxModelReplicas);
+  runConfig.maxModelReplicas = std::max<size_t>(1, std::min(runConfig.maxModelReplicas, runConfig.maxConcurrentJobs));
   runConfig.queueSize = std::max(runConfig.queueSize, runConfig.maxConcurrentJobs);
 
-  spdlog::info("Server resource policy: profile={} hardware_threads={} cpu_threads={} max_jobs={} chunk_workers={} max_model_replicas={} queue_size={}",
-               runConfig.cpuProfile, hardwareThreads, runConfig.cpuThreads.value_or(0),
-               runConfig.maxConcurrentJobs, runConfig.chunkWorkers,
-               runConfig.maxModelReplicas, runConfig.queueSize);
+  spdlog::info("Server resource policy: profile={} detected_threads={} detected_memory_mb={} cpu_threads={} chunk_workers={} max_jobs={} max_model_replicas={} queue_size={} max_temp_bytes={}",
+               runConfig.cpuProfile, hardwareThreads,
+               memoryBytes == 0 ? 0 : memoryBytes / (1024ULL * 1024ULL),
+               runConfig.cpuThreads.value_or(0), runConfig.chunkWorkers,
+               runConfig.maxConcurrentJobs, runConfig.maxModelReplicas,
+               runConfig.queueSize, runConfig.maxTempBytes);
 }
 
 // ----------------------------------------------------------------------------
@@ -819,8 +1029,8 @@ void printUsage(char *argv[]) {
   cerr << "   --api-token             TOKEN protect API server with bearer token"
        << endl;
   cerr << "                                env/.env: PIPER_API_TOKEN" << endl;
-  cerr << "   --cpu-profile           NAME  auto resource profile: eco, balanced, "
-          "fast, max (server default: balanced)"
+  cerr << "   --cpu-profile           NAME  auto resource profile: auto, eco, "
+          "balanced, fast, max (server default: auto)"
        << endl;
   cerr << "   --max-concurrent-jobs   NUM   max accepted simultaneous API jobs "
           "(default: auto)"
@@ -838,7 +1048,7 @@ void printUsage(char *argv[]) {
           "(default: 60)"
        << endl;
   cerr << "   --max-temp-bytes       NUM   max temporary RAW audio bytes "
-          "(default: 1073741824)"
+          "(default: auto from memory/cgroup)"
        << endl;
   cerr << "   --output-retention-seconds NUM seconds generated API WAV files stay "
           "available (default: 3600)"
@@ -975,9 +1185,10 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
     } else if (arg == "--cpu-profile" || arg == "--cpu_profile") {
       ensureArg(argc, argv, i);
       runConfig.cpuProfile = string(argv[++i]);
-      if (runConfig.cpuProfile != "eco" && runConfig.cpuProfile != "balanced" &&
-          runConfig.cpuProfile != "fast" && runConfig.cpuProfile != "max") {
-        throw runtime_error("--cpu-profile must be eco, balanced, fast or max");
+      if (runConfig.cpuProfile != "auto" && runConfig.cpuProfile != "eco" &&
+          runConfig.cpuProfile != "balanced" && runConfig.cpuProfile != "fast" &&
+          runConfig.cpuProfile != "max") {
+        throw runtime_error("--cpu-profile must be auto, eco, balanced, fast or max");
       }
     } else if (arg == "--max-concurrent-jobs" || arg == "--max_concurrent_jobs") {
       ensureArg(argc, argv, i);
@@ -1020,6 +1231,7 @@ void parseArgs(int argc, char *argv[], RunConfig &runConfig) {
       if (tempBytes < 0) {
         throw runtime_error("--max-temp-bytes must be >= 0");
       }
+      runConfig.maxTempBytesExplicit = true;
       runConfig.maxTempBytes = static_cast<size_t>(tempBytes);
     } else if (arg == "--output-retention-seconds" || arg == "--output_retention_seconds") {
       ensureArg(argc, argv, i);

@@ -1617,12 +1617,14 @@ json resourcePolicyJson(const ServerOptions &options, const FairTtsScheduler &sc
   return json{{"mode", "auto"},
               {"profile", options.cpuProfile},
               {"hardware_threads", options.resourcePolicy.hardwareThreads},
+              {"memory_bytes", options.resourcePolicy.memoryBytes},
               {"cpu_threads_per_worker", options.cpuThreads.value_or(0)},
               {"max_concurrent_jobs", options.maxConcurrentJobs},
               {"chunk_workers", scheduler.workerTotal()},
               {"max_model_replicas", options.maxModelReplicas},
               {"queue_size", options.queueSize},
               {"queue_timeout_seconds", options.queueTimeoutSeconds},
+              {"max_temp_bytes", options.maxTempBytes},
               {"active_jobs", scheduler.activeJobCount()},
               {"waiting_jobs", scheduler.waitingJobCount()}};
 }
@@ -2170,19 +2172,24 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
     throw std::runtime_error("Could not listen on server socket");
   }
 
-  unsigned int hardwareThreads = std::thread::hardware_concurrency();
+  unsigned int hardwareThreads = options.detectedHardwareThreads;
+  if (hardwareThreads == 0) {
+    hardwareThreads = std::thread::hardware_concurrency();
+  }
   if (hardwareThreads == 0) {
     hardwareThreads = 1;
   }
   options.resourcePolicy.profile = options.cpuProfile;
   options.resourcePolicy.autoConfigured = true;
   options.resourcePolicy.hardwareThreads = hardwareThreads;
+  options.resourcePolicy.memoryBytes = options.detectedMemoryBytes;
   options.resourcePolicy.cpuThreadsPerWorker = static_cast<std::size_t>(options.cpuThreads.value_or(1));
   options.resourcePolicy.maxConcurrentJobs = options.maxConcurrentJobs;
   options.resourcePolicy.chunkWorkers = options.chunkWorkers;
   options.resourcePolicy.maxModelReplicas = options.maxModelReplicas;
   options.resourcePolicy.queueSize = options.queueSize;
   options.resourcePolicy.queueTimeoutSeconds = options.queueTimeoutSeconds;
+  options.resourcePolicy.maxTempBytes = options.maxTempBytes;
 
   spdlog::info("Piper API server listening on http://{}:{}", options.host,
                options.port);
@@ -2194,9 +2201,12 @@ void runServer(piper::PiperConfig &piperConfig, piper::Voice &voice,
   } else {
     spdlog::info("API token authentication enabled");
   }
-  spdlog::info("Resource policy: profile={} cpu_threads={} chunk_workers={} max_jobs={} queue_size={} replicas={}",
-               options.cpuProfile, options.cpuThreads.value_or(0), options.chunkWorkers,
-               options.maxConcurrentJobs, options.queueSize, options.maxModelReplicas);
+  spdlog::info("Resource policy: profile={} detected_threads={} detected_memory_mb={} cpu_threads={} chunk_workers={} max_jobs={} queue_size={} replicas={} max_temp_bytes={}",
+               options.cpuProfile, hardwareThreads,
+               options.detectedMemoryBytes == 0 ? 0 : options.detectedMemoryBytes / (1024ULL * 1024ULL),
+               options.cpuThreads.value_or(0), options.chunkWorkers,
+               options.maxConcurrentJobs, options.queueSize, options.maxModelReplicas,
+               options.maxTempBytes);
 
   ModelRegistry modelRegistry(options);
   modelRegistry.forceRefresh();

@@ -96,4 +96,6 @@ RUN mkdir -p /app/models /app/outputs
 EXPOSE 8080
 
 ENTRYPOINT ["/app/piper"]
+# Piper Neo uses --cpu-profile auto by default. It detects the CPU/memory
+# available inside Docker/cgroups and configures workers/replicas automatically.
 CMD ["--server", "--host", "0.0.0.0", "--port", "8080", "--models", "/app/models", "--output_dir", "/app/outputs"]

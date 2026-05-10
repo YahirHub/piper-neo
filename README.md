@@ -66,8 +66,7 @@ Recommended production-style example:
   --models models \
   --host 127.0.0.1 \
   --port 8080 \
-  --cpu-profile balanced \
-  --max-temp-bytes 1073741824 \
+  --cpu-profile auto \
   --output-retention-seconds 3600
 ```
 
@@ -144,10 +143,10 @@ curl http://127.0.0.1:8080/api/v1/status \
 
 ## Resource controls
 
-Auto mode is enabled by default in server mode, but these flags can override it:
+Auto mode is enabled by default in server mode. It detects CPU affinity, Docker/cgroup CPU quota and memory limit before choosing workers, jobs and model replicas. These flags can override it:
 
 ```bash
---cpu-profile eco|balanced|fast|max
+--cpu-profile auto|eco|balanced|fast|max
 --cpu-threads NUM|auto
 --max-concurrent-jobs NUM
 --chunk-workers NUM
@@ -156,12 +155,12 @@ Auto mode is enabled by default in server mode, but these flags can override it:
 --queue-timeout-seconds NUM
 --max-input-bytes NUM
 --max-text-chunk-bytes NUM
---max-temp-bytes NUM
+--max-temp-bytes NUM  # 0 = unlimited; if omitted, it is computed automatically
 --output-retention-seconds NUM
 --models-refresh-seconds NUM
 ```
 
-The server avoids collapse by splitting text into chunks, writing temporary RAW chunk files, assembling the final WAV at the end, limiting ONNX CPU threads, limiting concurrent jobs and cleaning generated files automatically.
+The server avoids collapse by splitting text into chunks, writing temporary RAW chunk files, assembling the final WAV at the end, tuning ONNX CPU threads/workers from available hardware, limiting replicas by memory and cleaning generated files automatically.
 
 ## Training helper
 

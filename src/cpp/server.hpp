@@ -2,6 +2,7 @@
 #define PIPER_SERVER_H_
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -21,15 +22,17 @@ struct ModelInfo {
 };
 
 struct ResourcePolicy {
-  std::string profile = "balanced";
+  std::string profile = "auto";
   bool autoConfigured = true;
   unsigned int hardwareThreads = 1;
+  std::uint64_t memoryBytes = 0;
   std::size_t cpuThreadsPerWorker = 1;
   std::size_t maxConcurrentJobs = 1;
   std::size_t chunkWorkers = 1;
   std::size_t maxModelReplicas = 1;
   std::size_t queueSize = 16;
   std::size_t queueTimeoutSeconds = 60;
+  std::size_t maxTempBytes = 0;
 };
 
 struct ServerOptions {
@@ -49,10 +52,12 @@ struct ServerOptions {
   std::size_t chunkWorkers = 0;
   std::size_t queueSize = 0;
   std::size_t queueTimeoutSeconds = 60;
-  std::string cpuProfile = "balanced";
+  std::string cpuProfile = "auto";
+  unsigned int detectedHardwareThreads = 0;
+  std::uint64_t detectedMemoryBytes = 0;
   ResourcePolicy resourcePolicy;
   std::string apiToken;
-  std::size_t maxTempBytes = 1024ULL * 1024ULL * 1024ULL;
+  std::size_t maxTempBytes = 0;
   std::size_t outputRetentionSeconds = 3600;
   std::size_t modelsRefreshSeconds = 30;
 };

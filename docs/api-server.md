@@ -51,12 +51,12 @@ Por defecto solo necesitas:
 ./piper --server --models models
 ```
 
-Puedes ajustar manualmente:
+Puedes ajustar manualmente; por defecto `--cpu-profile auto` detecta CPU/memoria expuesta por Docker/cgroups:
 
 ```bash
 ./piper --server \
   --models models \
-  --cpu-profile balanced \
+  --cpu-profile auto \
   --cpu-threads 2 \
   --max-concurrent-jobs 3 \
   --chunk-workers 3 \
@@ -81,7 +81,7 @@ Piper Neo evita el colapso del código original de estas formas:
 - Ensambla el WAV final al terminar.
 - Borra temporales al terminar, fallar o cancelar.
 - Limpia `outputs/tmp/` al arrancar.
-- Limita el almacenamiento temporal con `--max-temp-bytes`.
+- Calcula automáticamente el presupuesto temporal si no se especifica `--max-temp-bytes`; `0` desactiva el límite.
 - Elimina audios generados después de `--output-retention-seconds`.
 - Limita hilos ONNX con `--cpu-threads`.
 - Limita trabajos simultáneos con `--max-concurrent-jobs`.
