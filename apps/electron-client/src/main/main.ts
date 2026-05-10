@@ -48,6 +48,14 @@ function createWindow(): void {
     }
   });
 
+  win.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[Piper Neo Client] renderer load failed (${errorCode}): ${errorDescription} - ${validatedURL}`);
+  });
+
+  win.webContents.on('render-process-gone', (_event, details) => {
+    console.error(`[Piper Neo Client] renderer process gone: ${details.reason}`);
+  });
+
   if (isDev) {
     void win.loadURL(process.env.VITE_DEV_SERVER_URL as string);
     win.webContents.once('did-finish-load', () => {

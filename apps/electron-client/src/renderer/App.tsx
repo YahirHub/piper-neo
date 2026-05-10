@@ -9,15 +9,28 @@ import { HistoryPage } from './components/HistoryPage';
 import { SettingsPage } from './components/SettingsPage';
 import { SplashScreen } from './components/SplashScreen';
 
-function currentRoute(): RoutePath {
+function currentRoute(fallback: RoutePath): RoutePath {
   const pathname = window.location.pathname;
+
+  // In dev/http the clean routes (/models, /settings, etc.) are safe.
   if (isRoutePath(pathname)) return pathname;
-  return '/';
+
+  // In packaged Electron the app is loaded from file://.../index.html, so
+  // pathname is the physical path to the file, not an app route. Keep the
+  // last persisted route instead of forcing '/' on every start.
+  return fallback;
+}
+
+function canUseCleanBrowserRoutes(): boolean {
+  return window.location.protocol === 'http:' || window.location.protocol === 'https:';
 }
 
 export function App() {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
-  const [route, setRoute] = useState<RoutePath>(() => currentRoute());
+  const [route, setRoute] = useState<RoutePath>(() => {
+    const loaded = loadSettings();
+    return currentRoute(loaded.lastRoute);
+  });
   const [showSplash, setShowSplash] = useState(true);
 
   useEffect(() => {
@@ -30,7 +43,7 @@ export function App() {
   }, [settings]);
 
   useEffect(() => {
-    const onPop = () => setRoute(currentRoute());
+    const onPop = () => setRoute(currentRoute(loadSettings().lastRoute));
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
@@ -45,7 +58,9 @@ export function App() {
   }, []);
 
   function navigate(path: RoutePath, persist = true) {
-    window.history.pushState({}, '', path);
+    if (canUseCleanBrowserRoutes()) {
+      window.history.pushState({}, '', path);
+    }
     setRoute(path);
     if (persist) setSettings((prev) => ({ ...prev, lastRoute: path }));
   }
