@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/branding/piper-neo-banner.png" alt="Piper Neo banner" width="100%">
+</p>
+
 # Piper Neo
 
 Piper Neo is the next evolution of Piper TTS: a more optimized, safer and production-friendly build focused on long texts, Latin American Spanish, local/API usage and controlled resource management.
