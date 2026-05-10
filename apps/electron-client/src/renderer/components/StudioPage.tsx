@@ -1,21 +1,33 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { PiperApiClient, PiperApiError } from '../lib/api';
 import { loadDraft, saveDraft } from '../lib/settings';
-import type { AppSettings, AudioHistoryItem, PiperModel, RoutePath, TtsPayload } from '../lib/types';
+import type { AppSettings, AudioHistoryItem, CurrentAudioState, PiperModel, RoutePath } from '../lib/types';
 import { Icon } from '../lib/icons';
 import { formatBytes, formatSeconds, modelDisplayName } from '../lib/format';
 import { saveHistoryItem } from '../lib/historyDb';
 import { StatusPill } from './StatusPill';
 
-export function StudioPage({ settings, updateSettings, navigate }: { settings: AppSettings; updateSettings: (next: Partial<AppSettings>) => void; navigate: (path: RoutePath) => void }) {
+export function StudioPage({
+  settings,
+  updateSettings,
+  navigate,
+  currentAudio,
+  setCurrentAudio
+}: {
+  settings: AppSettings;
+  updateSettings: (next: Partial<AppSettings>) => void;
+  navigate: (path: RoutePath) => void;
+  currentAudio: CurrentAudioState;
+  setCurrentAudio: (audio: CurrentAudioState) => void;
+}) {
   const client = useMemo(() => new PiperApiClient(settings), [settings.apiUrl, settings.token, settings.useToken]);
   const [text, setText] = useState(loadDraft());
   const [models, setModels] = useState<PiperModel[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [lastAudioUrl, setLastAudioUrl] = useState('');
-  const [lastResult, setLastResult] = useState<TtsPayload | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [pendingAutoPlay, setPendingAutoPlay] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -42,10 +54,33 @@ export function StudioPage({ settings, updateSettings, navigate }: { settings: A
   }, [client]);
 
   useEffect(() => {
-    return () => {
-      if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
-    };
-  }, [lastAudioUrl]);
+    if (!currentAudio.blob) {
+      setLastAudioUrl('');
+      return;
+    }
+
+    const url = URL.createObjectURL(currentAudio.blob);
+    setLastAudioUrl(url);
+
+    return () => URL.revokeObjectURL(url);
+  }, [currentAudio.blob]);
+
+  useEffect(() => {
+    if (!showSettings) return;
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') setShowSettings(false);
+    }
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showSettings]);
+
+  useEffect(() => {
+    if (!pendingAutoPlay || !lastAudioUrl) return;
+    setPendingAutoPlay(false);
+    window.setTimeout(() => void audioRef.current?.play(), 100);
+  }, [pendingAutoPlay, lastAudioUrl]);
 
   const selectedModel = models.find((model) => model.file === settings.selectedModel);
 
@@ -69,10 +104,13 @@ export function StudioPage({ settings, updateSettings, navigate }: { settings: A
         speakerId: shouldSendSpeaker ? settings.speakerId : undefined
       });
       const blob = await client.audio(result.url);
-      const url = URL.createObjectURL(blob);
-      if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
-      setLastAudioUrl(url);
-      setLastResult(result);
+      setCurrentAudio({
+        result,
+        blob,
+        text: text.trim(),
+        modelName: selectedModel ? modelDisplayName(selectedModel) : result.model,
+        createdAt: Date.now()
+      });
 
       if (settings.saveHistory) {
         const item: AudioHistoryItem = {
@@ -93,7 +131,7 @@ export function StudioPage({ settings, updateSettings, navigate }: { settings: A
       }
 
       if (settings.autoPlay) {
-        window.setTimeout(() => void audioRef.current?.play(), 100);
+        setPendingAutoPlay(true);
       }
     } catch (err) {
       setError(err instanceof PiperApiError ? err.message : 'No se pudo generar el audio.');
@@ -103,10 +141,10 @@ export function StudioPage({ settings, updateSettings, navigate }: { settings: A
   }
 
   function downloadCurrent() {
-    if (!lastAudioUrl || !lastResult) return;
+    if (!lastAudioUrl || !currentAudio.result) return;
     const anchor = document.createElement('a');
     anchor.href = lastAudioUrl;
-    anchor.download = lastResult.file || 'piper-neo.wav';
+    anchor.download = currentAudio.result.file || 'piper-neo.wav';
     anchor.click();
   }
 
@@ -142,17 +180,30 @@ export function StudioPage({ settings, updateSettings, navigate }: { settings: A
           <div className="audio-header">
             <div>
               <strong>Última generación</strong>
-              <small>{lastResult ? `${formatSeconds(lastResult.audio_seconds)} · ${formatBytes(lastResult.bytes)} · RTF ${lastResult.real_time_factor?.toFixed(2) ?? '—'}` : 'El audio aparecerá aquí automáticamente.'}</small>
+              <small>{currentAudio.result ? `${formatSeconds(currentAudio.result.audio_seconds)} · ${formatBytes(currentAudio.result.bytes)} · RTF ${currentAudio.result.real_time_factor?.toFixed(2) ?? '—'}` : 'El audio aparecerá aquí automáticamente.'}</small>
             </div>
             <button className="secondary-button" disabled={!lastAudioUrl} onClick={downloadCurrent}><Icon name="download" /> Descargar</button>
           </div>
           <audio ref={audioRef} controls src={lastAudioUrl || undefined} />
+          {currentAudio.result && (
+            <p className="audio-note">
+              Conservado en esta sesión: si cambias de página y vuelves al estudio, este audio seguirá disponible.
+            </p>
+          )}
         </div>
       </div>
 
       {showSettings && (
-        <aside className="studio-side panel slide-in-panel">
-          <h2>Ajustes de síntesis</h2>
+        <aside className="studio-side panel slide-in-panel" aria-label="Ajustes de síntesis">
+          <div className="studio-side-header">
+            <div>
+              <h2>Ajustes de síntesis</h2>
+              <small>Presiona Esc o la X para cerrar.</small>
+            </div>
+            <button className="icon-button" type="button" onClick={() => setShowSettings(false)} aria-label="Cerrar ajustes">
+              <Icon name="close" />
+            </button>
+          </div>
           <label className="field">
             <span>Speaker ID</span>
             <input
