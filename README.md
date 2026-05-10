@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/branding/piper-neo-banner.png" alt="Piper Neo banner" width="100%">
-</p>
-
 # Piper Neo
 
 Piper Neo is the next evolution of Piper TTS: a more optimized, safer and production-friendly build focused on long texts, Latin American Spanish, local/API usage and controlled resource management.
@@ -252,3 +248,23 @@ GET /api/v1/models/{model}/image
 ```
 
 Additional technical context is stored in `neo-docs/` so the project state can be recovered in future maintenance sessions.
+
+## Piper Neo Electron Client
+
+This repository includes an optional desktop client under `apps/electron-client`.
+
+The client is designed for local Piper Neo API servers and keeps runtime assets offline: icons are bundled as local SVG components, routes are handled inside the app, settings are persisted in `localStorage`, and generated audios are saved locally in `IndexedDB`.
+
+```bash
+cd apps/electron-client
+npm install
+npm run dev
+```
+
+Default API flow:
+
+1. Start Piper Neo server.
+2. Open the Electron client.
+3. Configure API URL and optional token.
+4. Select a model from `/api/v1/models?include=metadata`.
+5. Generate audio from the studio screen.
