@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.cli
+# Builds Piper Neo for Linux in the architecture selected by Docker/Buildx.
+#
+# Examples:
+#   docker compose -f docker-compose-cli.yml build
+#   docker buildx build --platform linux/amd64 -f Dockerfile.cli -t piper-neo-cli:amd64 .
+#   docker buildx build --platform linux/arm64 -f Dockerfile.cli -t piper-neo-cli:arm64 .
+
+ARG DEBIAN_VERSION=bookworm
+
+FROM debian:${DEBIAN_VERSION} AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      curl \
+      git \
+      libzstd-dev \
+      pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY . ./
+
+RUN echo "Docker target: ${TARGETOS:-linux}/${TARGETARCH:-$(dpkg --print-architecture)}${TARGETVARIANT}" && \
+    echo "Debian arch: $(dpkg --print-architecture)" && \
+    echo "Kernel arch: $(uname -m)"
+
+RUN cmake -S . -B /tmp/piper-build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/tmp/piper-install
+
+RUN cmake --build /tmp/piper-build --config Release --parallel "$(nproc)"
+RUN cmake --install /tmp/piper-build
+
+# Smoke test: if the CLI cannot print help, the image must not be produced.
+RUN /tmp/piper-install/piper --help
+
+# -----------------------------------------------------------------------------
+
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    LD_LIBRARY_PATH=/app \
+    PATH="/app:${PATH}" \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+      ca-certificates \
+      libgcc-s1 \
+      libgomp1 \
+      libstdc++6 \
+      libzstd1 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# The final runtime is installed directly in /app:
+#   /app/piper
+#   /app/espeak-ng-data
+#   /app/lib*.so / onnxruntime shared libraries copied by CMake install
+COPY --from=build /tmp/piper-install/ /app/
+
+# Runtime directories. They are created in the image, but persistence is managed
+# manually from docker-compose-cli.yml or your own deployment.
+RUN mkdir -p /app/models /app/outputs
+
+# Persistent paths you may want to mount manually:
+#   /app/models   -> voice models: .neo, .onnx and .onnx.json
+#   /app/outputs  -> generated API audio files and temporary synthesis/cache files
+#   /app/.env     -> optional API token/config file read from the working dir
+#
+# Intentionally commented: do not let Docker create anonymous volumes.
+# VOLUME ["/app/models"]
+# VOLUME ["/app/outputs"]
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/piper"]
+CMD ["--server", "--host", "0.0.0.0", "--port", "8080", "--models", "/app/models", "--output_dir", "/app/outputs"]

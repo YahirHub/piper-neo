@@ -1,0 +1,36 @@
+services:
+  piper-neo-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile.cli
+      # Docker/Buildx detects the target architecture automatically.
+      # To force one manually, uncomment one of these:
+      # platforms:
+      #   - linux/amd64
+      #   - linux/arm64
+    image: piper-neo-cli:local
+    container_name: piper-neo-cli
+    restart: unless-stopped
+    working_dir: /app
+    ports:
+      - "${PIPER_PORT:-8080}:8080"
+    volumes:
+      # Put your .neo or .onnx + .onnx.json models here.
+      - ./models:/app/models
+      # Optional persistent output/cache folder. Leave commented if you want
+      # generated audio and temporary files to stay inside the container.
+      # - ./outputs:/app/outputs
+      # Optional .env file. Piper also accepts PIPER_API_TOKEN/API_TOKEN as env vars.
+      # - ./.env:/app/.env:ro
+    # environment:
+    #   PIPER_API_TOKEN: "change-me"
+    command:
+      - --server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --models
+      - /app/models
+      - --output_dir
+      - /app/outputs
