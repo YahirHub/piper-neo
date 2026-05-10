@@ -62,8 +62,7 @@ Ejemplo recomendado:
   --models models \
   --host 127.0.0.1 \
   --port 8080 \
-  --cpu-profile balanced \
-  --max-temp-bytes 1073741824 \
+  --cpu-profile auto \
   --output-retention-seconds 3600
 ```
 
@@ -140,10 +139,10 @@ curl http://127.0.0.1:8080/api/v1/status \
 
 ## Control de recursos
 
-El modo automático se aplica por defecto en server, pero puedes ajustar estos parámetros:
+El modo automático se aplica por defecto en server. Detecta afinidad de CPU, cuota CPU de Docker/cgroups y límite de memoria antes de elegir workers, jobs y réplicas de modelo. Puedes ajustar estos parámetros:
 
 ```bash
---cpu-profile eco|balanced|fast|max
+--cpu-profile auto|eco|balanced|fast|max
 --cpu-threads NUM|auto
 --max-concurrent-jobs NUM
 --chunk-workers NUM
@@ -152,12 +151,12 @@ El modo automático se aplica por defecto en server, pero puedes ajustar estos p
 --queue-timeout-seconds NUM
 --max-input-bytes NUM
 --max-text-chunk-bytes NUM
---max-temp-bytes NUM
+--max-temp-bytes NUM  # 0 = sin límite; si no se especifica, se calcula automáticamente
 --output-retention-seconds NUM
 --models-refresh-seconds NUM
 ```
 
-El servidor evita colapsar dividiendo texto en chunks, escribiendo RAW temporales, ensamblando el WAV final al terminar, limitando hilos ONNX, limitando trabajos simultáneos y limpiando archivos generados automáticamente.
+El servidor evita colapsar dividiendo texto en chunks, escribiendo RAW temporales, ensamblando el WAV final al terminar, ajustando hilos/workers según el hardware disponible, limitando réplicas por memoria y limpiando archivos generados automáticamente.
 
 ## Helper para entrenamiento
 

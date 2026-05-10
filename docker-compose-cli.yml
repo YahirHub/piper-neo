@@ -24,6 +24,8 @@ services:
       # - ./.env:/app/.env:ro
     # environment:
     #   PIPER_API_TOKEN: "change-me"
+    # No CPU/RAM limits are declared here. Piper Neo uses --cpu-profile auto by
+    # default and detects the resources exposed to the container by Docker/cgroups.
     command:
       - --server
       - --host
