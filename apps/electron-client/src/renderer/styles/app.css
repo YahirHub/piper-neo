@@ -352,6 +352,38 @@ dt { color: var(--muted); } dd { margin: 0; }
   .splash-copy { left: 16px; right: 16px; bottom: 18px; }
   .splash-loader { right: 28px; top: 24px; bottom: auto; }
 }
+
+/* Studio persistence and settings panel controls */
+.audio-note {
+  margin: -4px 0 0;
+  color: var(--muted-2);
+  font-size: .86rem;
+  line-height: 1.5;
+}
+.studio-side-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+  padding-bottom: 4px;
+}
+.studio-side-header h2 { margin: 0; }
+.studio-side-header small {
+  display: block;
+  color: var(--muted-2);
+  margin-top: 5px;
+  line-height: 1.45;
+}
+.studio-side-header .icon-button {
+  flex: 0 0 auto;
+  border-color: rgba(255,255,255,.16);
+  background: rgba(255,255,255,.075);
+}
+.studio-side-header .icon-button:hover {
+  border-color: rgba(85,214,255,.36);
+  background: rgba(85,214,255,.12);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }

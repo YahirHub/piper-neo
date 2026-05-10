@@ -98,6 +98,15 @@ export interface TtsPayload {
   real_time_factor?: number;
 }
 
+
+export interface CurrentAudioState {
+  result: TtsPayload | null;
+  blob: Blob | null;
+  text: string;
+  modelName?: string;
+  createdAt?: number;
+}
+
 export interface AudioHistoryItem {
   id: string;
   createdAt: number;

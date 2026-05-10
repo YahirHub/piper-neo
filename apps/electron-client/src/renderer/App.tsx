@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { isRoutePath, loadSettings, saveSettings } from './lib/settings';
-import type { AppSettings, RoutePath } from './lib/types';
+import type { AppSettings, CurrentAudioState, RoutePath } from './lib/types';
 import { Shell } from './components/Shell';
 import { Onboarding } from './components/Onboarding';
 import { ModelsPage } from './components/ModelsPage';
@@ -32,6 +32,11 @@ export function App() {
     return currentRoute(loaded.lastRoute);
   });
   const [showSplash, setShowSplash] = useState(true);
+  const [currentAudio, setCurrentAudio] = useState<CurrentAudioState>({
+    result: null,
+    blob: null,
+    text: ''
+  });
 
   useEffect(() => {
     const timer = window.setTimeout(() => setShowSplash(false), 1700);
@@ -87,9 +92,9 @@ export function App() {
         return <SettingsPage settings={settings} updateSettings={updateSettings} replaceSettings={replaceSettings} navigate={navigate} />;
       case '/':
       default:
-        return <StudioPage settings={settings} updateSettings={updateSettings} navigate={navigate} />;
+        return <StudioPage settings={settings} updateSettings={updateSettings} navigate={navigate} currentAudio={currentAudio} setCurrentAudio={setCurrentAudio} />;
     }
-  }, [route, settings]);
+  }, [route, settings, currentAudio]);
 
   if (showSplash) {
     return <SplashScreen />;

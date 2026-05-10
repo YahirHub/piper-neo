@@ -20,7 +20,8 @@ export type IconName =
   | 'loader'
   | 'home'
   | 'volume'
-  | 'image';
+  | 'image'
+  | 'close';
 
 const paths: Record<IconName, ReactElement> = {
   spark: <path d="M12 2l1.7 5.2L19 9l-5.3 1.8L12 16l-1.7-5.2L5 9l5.3-1.8L12 2Zm6 12l.9 2.7L22 18l-3.1 1.3L18 22l-.9-2.7L14 18l3.1-1.3L18 14ZM5 14l.9 2.7L9 18l-3.1 1.3L5 22l-.9-2.7L1 18l3.1-1.3L5 14Z" />,
@@ -42,7 +43,8 @@ const paths: Record<IconName, ReactElement> = {
   loader: <path d="M21 12a9 9 0 0 1-9 9" />,
   home: <path d="M3 11 12 3l9 8v10h-6v-6H9v6H3V11Z" />,
   volume: <path d="M4 10v4h4l5 5V5L8 10H4Zm13-2a5 5 0 0 1 0 8m2.5-11a9 9 0 0 1 0 14" />,
-  image: <path d="M4 5h16v14H4V5Zm3 10 3-3 2 2 3-4 4 5M8 9h.01" />
+  image: <path d="M4 5h16v14H4V5Zm3 10 3-3 2 2 3-4 4 5M8 9h.01" />,
+  close: <path d="M6 6l12 12M18 6 6 18" />
 };
 
 export function Icon({ name, className, ...props }: { name: IconName; className?: string } & SVGProps<SVGSVGElement>) {
