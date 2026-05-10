@@ -1,40 +1,17 @@
-name: main
+name: release
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
-    tags:
-      - "*"
+    inputs:
+      release_tag:
+        description: "Tag/release exacto para subir assets. Déjalo vacío para usar release vacío existente o crear el siguiente 1.1, 1.2, 2.1..."
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 jobs:
-  # Builds desactivados temporalmente.
-  # Se dejan comentados para reactivarlos cuando se necesiten binarios Linux/macOS.
-  #
-  # build_linux:
-  #   name: "linux build"
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: docker/setup-qemu-action@v3
-  #     - uses: docker/setup-buildx-action@v3
-  #     - name: build
-  #       run: |
-  #         docker buildx build . --platform linux/amd64,linux/arm64,linux/arm/v7 --output 'type=local,dest=dist'
-  #     - name: upload artifacts
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: piper-linux
-  #         path: |
-  #           dist/linux_amd64/piper_amd64.tar.gz
-  #           dist/linux_arm64/piper_arm64.tar.gz
-  #           dist/linux_arm_v7/piper_armv7.tar.gz
-  #         if-no-files-found: error
-
   build_windows:
     runs-on: windows-latest
     name: "windows build: ${{ matrix.arch }}"
@@ -79,43 +56,16 @@ jobs:
           path: _install/piper_windows_amd64.zip
           if-no-files-found: error
 
-  # build_macos:
-  #   name: "macos build: ${{ matrix.arch }}"
-  #   runs-on: macos-latest
-  #   strategy:
-  #     fail-fast: true
-  #     matrix:
-  #       arch: [x64, aarch64]
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: configure
-  #       run: |
-  #         cmake -Bbuild -DCMAKE_INSTALL_PREFIX=_install/piper
-  #     - name: build
-  #       run: |
-  #         cmake --build build --config Release
-  #     - name: install
-  #       run: |
-  #         cmake --install build
-  #     - name: package
-  #       run: |
-  #         cd _install
-  #         tar -czf piper_macos_${{ matrix.arch }}.tar.gz piper/
-  #     - name: upload artifacts
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: piper-macos-${{ matrix.arch }}
-  #         path: _install/piper_macos_${{ matrix.arch }}.tar.gz
-  #         if-no-files-found: error
-
   release:
-    name: Create release
+    name: Create or update release
     runs-on: ubuntu-latest
     needs:
       - build_windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
@@ -124,46 +74,100 @@ jobs:
         run: |
           mkdir -p release-upload
           cp release-assets/piper-windows-amd64/piper_windows_amd64.zip release-upload/piper_windows_amd64.zip
-      - name: Prepare release metadata
+      - name: Resolve release version
         id: release_meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_RELEASE_TAG: ${{ github.event.inputs.release_tag }}
         shell: bash
         run: |
-          short_sha="${GITHUB_SHA::7}"
+          set -euo pipefail
 
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            release_tag="${GITHUB_REF_NAME}"
-            release_title="${GITHUB_REF_NAME}"
-            release_flags="--latest"
-            release_notes="Release ${GITHUB_REF_NAME}"
+          asset_name="piper_windows_amd64.zip"
+          requested="${INPUT_RELEASE_TAG:-}"
+
+          normalize_numeric_tag() {
+            local tag="$1"
+            tag="${tag#v}"
+            [[ "$tag" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+            echo "$tag"
+          }
+
+          release_exists() {
+            gh release view "$1" --json tagName >/dev/null 2>&1
+          }
+
+          release_has_asset() {
+            local tag="$1"
+            gh release view "$tag" --json assets --jq '.assets[]?.name' 2>/dev/null | grep -Fxq "$asset_name"
+          }
+
+          if [[ -n "$requested" ]]; then
+            release_tag="$requested"
           else
-            release_tag="master-${GITHUB_RUN_NUMBER}-${short_sha}"
-            release_title="Build master #${GITHUB_RUN_NUMBER} (${short_sha})"
-            release_flags="--prerelease --latest=false"
-            release_notes="Build automático desde master.\n\nCommit: ${GITHUB_SHA}\nRun: ${GITHUB_RUN_NUMBER}\nPlataforma: Windows amd64"
+            mapfile -t numeric_tags < <(
+              gh release list --limit 100 --json tagName,isDraft,isPrerelease \
+                --jq '.[] | select(.isDraft == false and .isPrerelease == false) | .tagName' \
+              | while read -r tag; do normalize_numeric_tag "$tag" || true; done \
+              | sort -t. -k1,1n -k2,2n
+            )
+
+            if [[ ${#numeric_tags[@]} -eq 0 ]]; then
+              release_tag="1.1"
+            else
+              latest="${numeric_tags[-1]}"
+              if release_exists "$latest" && ! release_has_asset "$latest"; then
+                # Caso esperado: creas manualmente 2.0 vacío y ejecutas el workflow.
+                # El compilado se sube a 2.0; el siguiente run creará 2.1.
+                release_tag="$latest"
+              else
+                major="${latest%%.*}"
+                minor="${latest##*.}"
+                release_tag="${major}.$((minor + 1))"
+              fi
+            fi
           fi
+
+          release_title="Piper Neo ${release_tag}"
+          release_notes="Build manual de Piper Neo.\n\nCommit: ${GITHUB_SHA}\nRun: ${GITHUB_RUN_NUMBER}\nPlataforma: Windows amd64"
 
           {
             echo "release_tag=${release_tag}"
             echo "release_title=${release_title}"
-            echo "release_flags=${release_flags}"
             echo "release_notes<<EOF"
             echo -e "${release_notes}"
             echo "EOF"
           } >> "${GITHUB_OUTPUT}"
       - name: Write release notes
         shell: bash
+        env:
+          RELEASE_NOTES: ${{ steps.release_meta.outputs.release_notes }}
         run: |
-          cat > release-notes.md <<'EOF'
-          ${{ steps.release_meta.outputs.release_notes }}
-          EOF
-      - name: Create GitHub release
+          printf '%s\n' "$RELEASE_NOTES" > release-notes.md
+      - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          gh release create "${{ steps.release_meta.outputs.release_tag }}" release-upload/* \
-            --repo "${GITHUB_REPOSITORY}" \
-            --target "${GITHUB_SHA}" \
-            --title "${{ steps.release_meta.outputs.release_title }}" \
-            --notes-file release-notes.md \
-            ${{ steps.release_meta.outputs.release_flags }}
+          set -euo pipefail
+          tag="${{ steps.release_meta.outputs.release_tag }}"
+          title="${{ steps.release_meta.outputs.release_title }}"
+
+          if gh release view "$tag" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              --latest
+            gh release upload "$tag" release-upload/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          else
+            gh release create "$tag" release-upload/* \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "$title" \
+              --notes-file release-notes.md \
+              --latest
+          fi
