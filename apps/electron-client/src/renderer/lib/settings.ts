@@ -15,6 +15,7 @@ export const defaultSettings: AppSettings = {
   autoPlay: true,
   saveHistory: true,
   lastRoute: '/setup',
+  modelReturnRoute: '',
   llmApiUrl: 'http://127.0.0.1:11434/v1',
   llmToken: '',
   llmUseToken: false,

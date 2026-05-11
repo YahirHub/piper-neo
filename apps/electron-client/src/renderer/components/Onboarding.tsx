@@ -33,8 +33,13 @@ export function Onboarding({ settings, updateSettings, navigate }: { settings: A
     }
   }
 
+  function choosePreset(url: string) {
+    setApiUrl(url);
+    setMessage(null);
+  }
+
   return (
-    <section className="setup-page">
+    <section className="setup-page setup-page-pro">
       <div className="hero-card setup-hero">
         <div className="setup-copy">
           <Brand />
@@ -42,13 +47,20 @@ export function Onboarding({ settings, updateSettings, navigate }: { settings: A
           <p>
             Configura una sola vez la URL de la API, agrega token solo si tu servidor lo usa y el cliente recordará tus modelos, texto y audios generados.
           </p>
-          <div className="feature-grid mini">
+          <div className="feature-grid mini setup-feature-river">
             <div><Icon name="server" /> API local</div>
             <div><Icon name="shield" /> Token opcional</div>
             <div><Icon name="history" /> Historial offline</div>
           </div>
+          <div className="setup-progress-row" aria-hidden="true">
+            <span className="active" />
+            <span />
+            <span />
+          </div>
         </div>
-        <div className="orbital-card" aria-hidden="true">
+        <div className="orbital-card setup-orbital-pro" aria-hidden="true">
+          <span className="orbit-ring ring-a" />
+          <span className="orbit-ring ring-b" />
           <div className="orbital-core"><Icon name="wave" /></div>
           <span className="orbit-dot dot-a" />
           <span className="orbit-dot dot-b" />
@@ -62,6 +74,11 @@ export function Onboarding({ settings, updateSettings, navigate }: { settings: A
           <div className="input-with-icon">
             <Icon name="link" />
             <input value={apiUrl} onChange={(event) => setApiUrl(event.target.value)} placeholder="http://127.0.0.1:8080" />
+          </div>
+          <div className="setup-presets">
+            <button type="button" onClick={() => choosePreset('http://127.0.0.1:8080')}>Local</button>
+            <button type="button" onClick={() => choosePreset('http://localhost:8080')}>localhost</button>
+            <button type="button" onClick={() => choosePreset('http://piper-neo:8080')}>Docker</button>
           </div>
         </label>
 
@@ -85,7 +102,13 @@ export function Onboarding({ settings, updateSettings, navigate }: { settings: A
 
         {message && <StatusPill type={message.type === 'ok' ? 'ok' : message.type === 'danger' ? 'danger' : 'warn'}>{message.text}</StatusPill>}
 
-        <button className="primary-button full" disabled={checking} onClick={checkConnection}>
+        <div className={`setup-checklist ${checking ? 'checking' : ''}`}>
+          <span><Icon name="link" /> URL</span>
+          <span><Icon name="shield" /> Token opcional</span>
+          <span><Icon name="check" /> Check</span>
+        </div>
+
+        <button className="primary-button full setup-continue" disabled={checking} onClick={checkConnection}>
           {checking ? <Icon name="loader" className="spin" /> : <Icon name="check" />}
           {checking ? 'Comprobando...' : 'Comprobar y continuar'}
         </button>

@@ -23,7 +23,7 @@ import { StatusPill } from './StatusPill';
 interface ChatPageProps {
   settings: AppSettings;
   updateSettings: (next: Partial<AppSettings>) => void;
-  navigate: (path: RoutePath) => void;
+  navigate: (path: RoutePath, persist?: boolean) => void;
   chatAudioBlobs: Record<string, Blob>;
   setChatAudioBlobs: (next: Record<string, Blob>) => void;
 }
@@ -152,40 +152,33 @@ function highlightCode(code: string) {
   return chunks;
 }
 
+
+function isLikelyHtmlCode(lang: string, code: string): boolean {
+  const normalizedLang = lang.trim().toLowerCase();
+  const sample = code.trim().slice(0, 1200).toLowerCase();
+  return ['html', 'htm', 'xhtml'].includes(normalizedLang)
+    || sample.startsWith('<!doctype html')
+    || sample.startsWith('<html')
+    || /<(html|head|body|main|section|article|div|style|script|canvas|svg)[\s>]/i.test(code);
+}
+
+async function openHtmlPreview(code: string) {
+  const html = code.trim();
+  if (!html) return;
+
+  if (window.piperNeoDesktop?.openHtmlPreview) {
+    await window.piperNeoDesktop.openHtmlPreview(html);
+    return;
+  }
+
+  const blob = new Blob([html], { type: 'text/html' });
+  const url = URL.createObjectURL(blob);
+  const opened = window.open(url, '_blank', 'popup=yes,width=1280,height=840');
+  window.setTimeout(() => URL.revokeObjectURL(url), opened ? 30000 : 3000);
+}
+
 function MarkdownMessage({ content }: { content: string }) {
-  const [copied, setCopied] = useState('');
   const parts = splitMarkdown(content);
-
-  async function copyCode(code: string) {
-    const text = code.trimEnd();
-    try {
-      if (window.piperNeoDesktop?.clipboardWriteText) {
-        await window.piperNeoDesktop.clipboardWriteText(text);
-      } else if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.setAttribute('readonly', 'true');
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        textarea.remove();
-      }
-
-      setCopied(partKeyForCopy(text));
-      window.setTimeout(() => setCopied(''), 1300);
-    } catch {
-      setCopied('error');
-      window.setTimeout(() => setCopied(''), 1600);
-    }
-  }
-
-  function partKeyForCopy(code: string) {
-    return `${code.length}:${code.slice(0, 80)}`;
-  }
 
   return (
     <div className="markdown-message">
@@ -195,9 +188,6 @@ function MarkdownMessage({ content }: { content: string }) {
             <div className="code-card" key={`code-${index}`}>
               <div className="code-card-top">
                 <span>{part.lang || 'code'}</span>
-                <button className="ghost-icon-button" onClick={() => void copyCode(part.text)} title="Copiar código">
-                  {copied === 'error' ? <Icon name="alert" /> : copied === partKeyForCopy(part.text.trimEnd()) ? <Icon name="check" /> : <Icon name="copy" />}
-                </button>
               </div>
               <pre><code>{highlightCode(part.text)}</code></pre>
             </div>
@@ -218,6 +208,18 @@ function MarkdownMessage({ content }: { content: string }) {
       })}
     </div>
   );
+}
+
+function getCodeBlocks(content: string) {
+  return splitMarkdown(content).filter((part): part is { type: 'code'; lang: string; text: string } => part.type === 'code' && part.text.trim().length > 0);
+}
+
+function codeBlocksText(content: string) {
+  return getCodeBlocks(content).map((part) => part.text.trimEnd()).join('\n\n').trim();
+}
+
+function firstHtmlBlock(content: string) {
+  return getCodeBlocks(content).find((part) => isLikelyHtmlCode(part.lang, part.text));
 }
 
 export function ChatPage({
@@ -244,8 +246,10 @@ export function ChatPage({
   const [modelError, setModelError] = useState('');
   const [playbackUrl, setPlaybackUrl] = useState('');
   const [playbackMessageId, setPlaybackMessageId] = useState('');
+  const [audioPlayingId, setAudioPlayingId] = useState('');
   const [pendingPlay, setPendingPlay] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [copiedActionId, setCopiedActionId] = useState('');
   const listEndRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const autoScrollEnabledRef = useRef(true);
@@ -256,6 +260,7 @@ export function ChatPage({
   const selectedPiperModel = piperModels.find((model) => model.file === settings.selectedModel);
   const selectedLlmModel = activeLlmModel(settings);
   const canSend = Boolean(draft.trim() && selectedLlmModel && settings.selectedModel && !busy);
+  const lastAssistantId = useMemo(() => [...messages].reverse().find((message) => message.role === 'assistant' && message.content)?.id ?? '', [messages]);
 
   function setAutoScroll(value: boolean) {
     autoScrollEnabledRef.current = value;
@@ -313,7 +318,12 @@ export function ChatPage({
   useEffect(() => {
     if (!pendingPlay || !playbackUrl) return;
     setPendingPlay(false);
-    window.setTimeout(() => void audioRef.current?.play(), 120);
+    window.setTimeout(() => {
+      const playPromise = audioRef.current?.play();
+      if (playPromise) {
+        void playPromise.catch(() => setAudioPlayingId(''));
+      }
+    }, 120);
   }, [pendingPlay, playbackUrl]);
 
   useEffect(() => {
@@ -394,7 +404,7 @@ export function ChatPage({
 
     const text = speechText.trim();
     if (!text) {
-      setMessages(sourceMessages.map((item) => item.id === message.id ? { ...item, error: 'Respuesta omitida para voz porque solo contenía código o markdown técnico.' } : item));
+      setMessages(sourceMessages.map((item) => item.id === message.id ? { ...item, error: 'Respuesta omitida para voz porque no hay texto legible para narrar.' } : item));
       return;
     }
 
@@ -438,6 +448,7 @@ export function ChatPage({
     const url = URL.createObjectURL(blob);
     setPlaybackUrl(url);
     setPlaybackMessageId(messageId);
+    setAudioPlayingId(messageId);
     setPendingPlay(true);
   }
 
@@ -535,6 +546,31 @@ export function ChatPage({
     await completeChat(nextMessages);
   }
 
+  async function copyTextToClipboard(text: string, actionId: string) {
+    try {
+      if (window.piperNeoDesktop?.clipboardWriteText) {
+        await window.piperNeoDesktop.clipboardWriteText(text);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', 'true');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        textarea.remove();
+      }
+      setCopiedActionId(actionId);
+      window.setTimeout(() => setCopiedActionId(''), 1400);
+    } catch {
+      setCopiedActionId(`error:${actionId}`);
+      window.setTimeout(() => setCopiedActionId(''), 1600);
+    }
+  }
+
   async function regenerateLastAnswer() {
     if (busy) return;
     const lastAssistantIndex = [...messages].reverse().findIndex((message) => message.role === 'assistant');
@@ -563,7 +599,13 @@ export function ChatPage({
     if (playbackUrl) URL.revokeObjectURL(playbackUrl);
     setPlaybackUrl('');
     setPlaybackMessageId('');
+    setAudioPlayingId('');
     enableAutoScroll('auto');
+  }
+
+  function openVoiceSelector() {
+    updateSettings({ modelReturnRoute: '/chat' });
+    navigate('/models', false);
   }
 
   return (
@@ -581,16 +623,16 @@ export function ChatPage({
           <span>{settings.selectedModel || 'Voz sin seleccionar'}</span>
         </div>
         <div className="chatgpt-actions">
-          <button className="ghost-icon-button" onClick={() => void refreshAllModels(true)} disabled={loadingModels} title="Cargar modelos">
-            <Icon name={loadingModels ? 'loader' : 'models'} className={loadingModels ? 'spin' : undefined} />
-          </button>
-          <button className="ghost-icon-button" onClick={regenerateLastAnswer} disabled={busy || !messages.some((message) => message.role === 'assistant')} title="Regenerar">
-            <Icon name="refresh" />
+          {audioPlayingId && (
+            <span className="chatgpt-speaking-pill"><Icon name="wave" /> Hablando</span>
+          )}
+          <button className="ghost-icon-button" onClick={openVoiceSelector} title="Cambiar voz">
+            <Icon name="mic" />
           </button>
           <button className="ghost-icon-button" onClick={newChat} disabled={busy || messages.length === 0} title="Nuevo chat">
             <Icon name="chat" />
           </button>
-          <button className="ghost-icon-button" onClick={() => setShowSettings((value) => !value)} title="Ajustes">
+          <button className="ghost-icon-button" onClick={() => setShowSettings((value) => !value)} title="Ajustes del proveedor LLM">
             <Icon name="settings" />
           </button>
         </div>
@@ -619,10 +661,42 @@ export function ChatPage({
                 {message.content ? <MarkdownMessage content={message.content} /> : <div className="stream-caret"><span /> <span /> <span /></div>}
                 {message.role === 'assistant' && message.content && (
                   <div className="chatgpt-message-actions">
-                    <button className="secondary-button small-button" onClick={() => void playMessage(message)} disabled={audioBusyId === message.id}>
+                    <button className={`secondary-button small-button ${audioPlayingId === message.id ? 'audio-active' : ''}`} onClick={() => void playMessage(message)} disabled={audioBusyId === message.id}>
                       <Icon name={audioBusyId === message.id ? 'loader' : 'play'} className={audioBusyId === message.id ? 'spin' : undefined} />
-                      {playbackMessageId === message.id ? 'Reproducir otra vez' : 'Play'}
+                      {audioPlayingId === message.id ? 'Reproduciendo' : playbackMessageId === message.id ? 'Repetir' : 'Play'}
                     </button>
+                    {codeBlocksText(message.content) && (
+                      <button
+                        className="secondary-button small-button"
+                        onClick={() => void copyTextToClipboard(codeBlocksText(message.content), `code:${message.id}`)}
+                        disabled={busy}
+                      >
+                        <Icon name={copiedActionId === `error:code:${message.id}` ? 'alert' : copiedActionId === `code:${message.id}` ? 'check' : 'copy'} />
+                        {copiedActionId === `code:${message.id}` ? 'Copiado' : 'Copiar código'}
+                      </button>
+                    )}
+                    {firstHtmlBlock(message.content) && (
+                      <button
+                        className="secondary-button small-button"
+                        onClick={() => {
+                          const htmlBlock = firstHtmlBlock(message.content);
+                          if (htmlBlock) void openHtmlPreview(htmlBlock.text);
+                        }}
+                        disabled={busy}
+                      >
+                        <Icon name="preview" />
+                        Vista previa
+                      </button>
+                    )}
+                    {message.id === lastAssistantId && (
+                      <button className="secondary-button small-button" onClick={regenerateLastAnswer} disabled={busy}>
+                        <Icon name="refresh" />
+                        Regenerar
+                      </button>
+                    )}
+                    {audioPlayingId === message.id && (
+                      <span className="bubble-audio-wave" aria-label="Audio en reproducción"><i /><i /><i /><i /></span>
+                    )}
                     {message.audio && <small>{formatSeconds(message.audio.audioSeconds)} · {formatBytes(message.audio.bytes)}</small>}
                     {message.error && <small className="danger-text">{message.error}</small>}
                   </div>
@@ -653,9 +727,14 @@ export function ChatPage({
       </main>
 
       <footer className="chatgpt-composer-wrap">
-        <div className="chatgpt-player-row">
-          <audio ref={audioRef} controls src={playbackUrl || undefined} />
-        </div>
+        <audio
+          ref={audioRef}
+          className="chatgpt-hidden-audio"
+          src={playbackUrl || undefined}
+          onPlay={() => setAudioPlayingId(playbackMessageId)}
+          onPause={() => setAudioPlayingId('')}
+          onEnded={() => setAudioPlayingId('')}
+        />
         <div className="chatgpt-composer">
           <textarea
             ref={textareaRef}
@@ -707,6 +786,11 @@ export function ChatPage({
             </label>
           )}
 
+          <button className="secondary-button full" onClick={() => void refreshAllModels(true)} disabled={loadingModels}>
+            <Icon name={loadingModels ? 'loader' : 'models'} className={loadingModels ? 'spin' : undefined} />
+            {loadingModels ? 'Cargando modelos...' : 'Cargar modelos LLM'}
+          </button>
+
           <div className="drawer-two-cols">
             <label className="field">
               <span>Modelo listado</span>
@@ -744,7 +828,12 @@ export function ChatPage({
 
           <div className="model-details compact-model-details">
             <p>{selectedPiperModel ? modelDisplayName(selectedPiperModel) : settings.selectedModel || 'Sin voz'}</p>
-            <button className="secondary-button full" onClick={() => navigate('/models')}><Icon name="models" /> Cambiar voz</button>
+            <button
+              className="secondary-button full"
+              onClick={openVoiceSelector}
+            >
+              <Icon name="models" /> Cambiar voz
+            </button>
           </div>
             </div>
           </aside>

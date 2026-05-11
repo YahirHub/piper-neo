@@ -28,6 +28,43 @@ interface DesktopHttpStreamRequest extends DesktopHttpRequest {
   streamId: string;
 }
 
+
+function registerHtmlPreviewBridge(): void {
+  ipcMain.handle('desktop:open-html-preview', async (_event, html: string): Promise<boolean> => {
+    const preview = new BrowserWindow({
+      width: 1280,
+      height: 840,
+      show: false,
+      backgroundColor: '#0b1020',
+      autoHideMenuBar: true,
+      title: 'Vista previa HTML — Piper Neo',
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webSecurity: true
+      }
+    });
+
+    preview.once('ready-to-show', () => {
+      preview.maximize();
+      preview.show();
+    });
+
+    preview.webContents.setWindowOpenHandler(({ url }) => {
+      if (url.startsWith('https://') || url.startsWith('http://')) {
+        void shell.openExternal(url);
+      }
+      return { action: 'deny' };
+    });
+
+    const document = String(html ?? '').trim();
+    const previewHtml = document || '<!doctype html><html><body></body></html>';
+    await preview.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(previewHtml)}`);
+    return true;
+  });
+}
+
 function registerClipboardBridge(): void {
   ipcMain.handle('desktop:clipboard-write-text', async (_event, text: string): Promise<boolean> => {
     clipboard.writeText(String(text ?? ''));
@@ -209,6 +246,7 @@ function createWindow(): void {
 app.whenReady().then(() => {
   registerHttpProxy();
   registerClipboardBridge();
+  registerHtmlPreviewBridge();
 
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
     callback(false);

@@ -113,12 +113,12 @@ export function App() {
   }
 
   if (settings.connected && route === '/chat') {
-    return <>{page}</>;
+    return <div key={route} className="route-transition fullscreen-route">{page}</div>;
   }
 
   return (
     <Shell route={route} connected={settings.connected} selectedModel={settings.selectedModel} navigate={navigate}>
-      {page}
+      <div key={route} className="route-transition">{page}</div>
     </Shell>
   );
 }

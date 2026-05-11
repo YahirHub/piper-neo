@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('piperNeoDesktop', {
     timeoutMs?: number;
   }) => ipcRenderer.invoke('desktop:http-request', request),
   clipboardWriteText: (text: string) => ipcRenderer.invoke('desktop:clipboard-write-text', text),
+  openHtmlPreview: (html: string) => ipcRenderer.invoke('desktop:open-html-preview', html),
   httpStream: (
     request: {
       url: string;

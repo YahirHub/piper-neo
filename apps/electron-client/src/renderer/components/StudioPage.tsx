@@ -28,6 +28,9 @@ export function StudioPage({
   const [lastAudioUrl, setLastAudioUrl] = useState('');
   const [showSettings, setShowSettings] = useState(false);
   const [pendingAutoPlay, setPendingAutoPlay] = useState(false);
+  const [playerPlaying, setPlayerPlaying] = useState(false);
+  const [playerCurrentTime, setPlayerCurrentTime] = useState(0);
+  const [playerDuration, setPlayerDuration] = useState(0);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -83,6 +86,30 @@ export function StudioPage({
   }, [pendingAutoPlay, lastAudioUrl]);
 
   const selectedModel = models.find((model) => model.file === settings.selectedModel);
+
+  function formatPlayerTime(seconds: number) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const minutes = Math.floor(seconds / 60);
+    const remaining = Math.floor(seconds % 60).toString().padStart(2, '0');
+    return `${minutes}:${remaining}`;
+  }
+
+  function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio || !lastAudioUrl) return;
+    if (audio.paused) {
+      void audio.play();
+    } else {
+      audio.pause();
+    }
+  }
+
+  function seekPlayer(value: number) {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = value;
+    setPlayerCurrentTime(value);
+  }
 
   async function synthesize() {
     if (!settings.selectedModel) {
@@ -149,48 +176,87 @@ export function StudioPage({
   }
 
   return (
-    <section className={`studio-layout ${showSettings ? 'settings-open' : ''}`}>
+    <section className={`studio-layout studio-redesign ${showSettings ? 'settings-open' : ''}`}>
       <div className="studio-main page-stack">
-        <header className="page-header split">
-          <div>
-            <StatusPill type={settings.selectedModel ? 'ok' : 'warn'}>{settings.selectedModel ? `Modelo: ${settings.selectedModel}` : 'Selecciona un modelo'}</StatusPill>
-            <h1>Estudio de voz local</h1>
-            <p>Escribe, convierte y reproduce audio usando tu servidor Piper Neo local.</p>
+        <header className="studio-hero panel">
+          <div className="studio-hero-copy">
+            <StatusPill type={settings.selectedModel ? 'ok' : 'warn'}>{settings.selectedModel ? `Voz activa: ${settings.selectedModel}` : 'Selecciona un modelo'}</StatusPill>
+            <h1>Estudio</h1>
+            <p>Convierte texto a voz localmente con Piper Neo. El texto y el último audio se conservan al cambiar de pantalla.</p>
           </div>
-          <div className="actions-row">
+          <div className="studio-hero-actions">
             <button className="secondary-button" onClick={() => navigate('/models')}><Icon name="models" /> Modelos</button>
-            <button className={`secondary-button ${showSettings ? 'active-action' : ''}`} onClick={() => setShowSettings((value) => !value)}><Icon name="settings" /> {showSettings ? 'Cerrar ajustes' : 'Ajustes'}</button>
+            <button className={`secondary-button ${showSettings ? 'active-action' : ''}`} onClick={() => setShowSettings((value) => !value)}><Icon name="settings" /> {showSettings ? 'Cerrar' : 'Ajustes'}</button>
           </div>
         </header>
 
-        <div className="composer panel">
-          <textarea ref={textareaRef} value={text} onChange={(event) => setText(event.target.value)} placeholder="Escribe aquí el texto que quieres convertir a voz..." />
-          <div className="composer-footer">
-            <span>{new Blob([text]).size.toLocaleString('es-MX')} bytes · {text.trim().split(/\s+/).filter(Boolean).length} palabras</span>
-            <button className="primary-button" disabled={busy || !text.trim()} onClick={synthesize}>
-              <Icon name={busy ? 'loader' : 'play'} className={busy ? 'spin' : undefined} />
-              {busy ? 'Convirtiendo...' : 'Convertir a audio'}
-            </button>
+        <div className="studio-workspace">
+          <div className="composer panel studio-composer-card">
+            <div className="studio-section-label">
+              <span>Texto a sintetizar</span>
+              <small>{new Blob([text]).size.toLocaleString('es-MX')} bytes · {text.trim().split(/\s+/).filter(Boolean).length} palabras</small>
+            </div>
+            <textarea ref={textareaRef} value={text} onChange={(event) => setText(event.target.value)} placeholder="Escribe aquí el texto que quieres convertir a voz..." />
+            <div className="composer-footer studio-composer-footer">
+              <span>{selectedModel ? modelDisplayName(selectedModel) : 'Sin modelo seleccionado'}</span>
+              <button className="primary-button studio-convert-button" disabled={busy || !text.trim()} onClick={synthesize}>
+                <Icon name={busy ? 'loader' : 'play'} className={busy ? 'spin' : undefined} />
+                {busy ? 'Convirtiendo...' : 'Convertir a audio'}
+              </button>
+            </div>
+          </div>
+
+          <div className="audio-panel panel studio-player-card">
+            <div className="audio-header">
+              <div>
+                <strong>Reproductor</strong>
+                <small>{currentAudio.result ? `${formatSeconds(currentAudio.result.audio_seconds)} · ${formatBytes(currentAudio.result.bytes)} · RTF ${currentAudio.result.real_time_factor?.toFixed(2) ?? '—'}` : 'El audio aparecerá aquí automáticamente.'}</small>
+              </div>
+              <button className="secondary-button" disabled={!lastAudioUrl} onClick={downloadCurrent}><Icon name="download" /> Descargar</button>
+            </div>
+
+            <audio
+              ref={audioRef}
+              src={lastAudioUrl || undefined}
+              onLoadedMetadata={(event) => setPlayerDuration(event.currentTarget.duration || 0)}
+              onTimeUpdate={(event) => setPlayerCurrentTime(event.currentTarget.currentTime || 0)}
+              onPlay={() => setPlayerPlaying(true)}
+              onPause={() => setPlayerPlaying(false)}
+              onEnded={() => setPlayerPlaying(false)}
+            />
+
+            <div className={`custom-audio-player ${playerPlaying ? 'playing' : ''}`}>
+              <button className="player-main-button" disabled={!lastAudioUrl} onClick={togglePlayback} aria-label={playerPlaying ? 'Pausar audio' : 'Reproducir audio'}>
+                <Icon name={playerPlaying ? 'pause' : 'play'} />
+              </button>
+              <div className="player-body">
+                <div className="player-title-row">
+                  <span>{currentAudio.modelName || 'Última generación'}</span>
+                  <small>{formatPlayerTime(playerCurrentTime)} / {formatPlayerTime(playerDuration || currentAudio.result?.audio_seconds || 0)}</small>
+                </div>
+                <input
+                  className="player-range"
+                  type="range"
+                  min={0}
+                  max={playerDuration || currentAudio.result?.audio_seconds || 0}
+                  step={0.01}
+                  value={Math.min(playerCurrentTime, playerDuration || currentAudio.result?.audio_seconds || 0)}
+                  disabled={!lastAudioUrl}
+                  onChange={(event) => seekPlayer(Number(event.target.value))}
+                />
+              </div>
+              <div className="player-bars" aria-hidden="true"><i /><i /><i /><i /></div>
+            </div>
+
+            {currentAudio.result && (
+              <p className="audio-note">
+                Conservado en esta sesión: si cambias de página y vuelves al estudio, este audio seguirá disponible.
+              </p>
+            )}
           </div>
         </div>
 
         {error && <StatusPill type="danger">{error}</StatusPill>}
-
-        <div className="audio-panel panel">
-          <div className="audio-header">
-            <div>
-              <strong>Última generación</strong>
-              <small>{currentAudio.result ? `${formatSeconds(currentAudio.result.audio_seconds)} · ${formatBytes(currentAudio.result.bytes)} · RTF ${currentAudio.result.real_time_factor?.toFixed(2) ?? '—'}` : 'El audio aparecerá aquí automáticamente.'}</small>
-            </div>
-            <button className="secondary-button" disabled={!lastAudioUrl} onClick={downloadCurrent}><Icon name="download" /> Descargar</button>
-          </div>
-          <audio ref={audioRef} controls src={lastAudioUrl || undefined} />
-          {currentAudio.result && (
-            <p className="audio-note">
-              Conservado en esta sesión: si cambias de página y vuelves al estudio, este audio seguirá disponible.
-            </p>
-          )}
-        </div>
       </div>
 
       {showSettings && (

@@ -118,6 +118,39 @@ function consumeOpenAiStreamChunk(buffer: string, onDelta: (delta: string) => vo
   return remaining;
 }
 
+
+const LLM_RETRY_DELAYS_MS = [650, 1500];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isRetriableLlmError(error: unknown): boolean {
+  if (error instanceof LlmApiError) {
+    if (error.status && [401, 403, 404].includes(error.status)) return false;
+    return ['llm_timeout', 'llm_network_error', 'llm_empty_response', 'llm_request_failed'].includes(error.code)
+      || Boolean(error.status && (error.status === 408 || error.status === 409 || error.status === 429 || error.status >= 500));
+  }
+
+  return true;
+}
+
+async function withRetry<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts - 1 || !isRetriableLlmError(error)) break;
+      await sleep(LLM_RETRY_DELAYS_MS[Math.min(attempt, LLM_RETRY_DELAYS_MS.length - 1)]);
+    }
+  }
+
+  throw lastError;
+}
+
 export class OpenAiCompatibleClient {
   readonly baseUrl: string;
   private readonly token: string;
@@ -214,7 +247,7 @@ export class OpenAiCompatibleClient {
   }
 
   async models(): Promise<LlmModelInfo[]> {
-    const payload = await this.request<LlmModelListResponse>('/models', undefined, 15000);
+    const payload = await withRetry(() => this.request<LlmModelListResponse>('/models', undefined, 15000));
     return Array.isArray(payload?.data) ? payload.data : [];
   }
 
@@ -235,6 +268,37 @@ export class OpenAiCompatibleClient {
   }
 
   async chatCompletionStream(input: {
+    model: string;
+    messages: LlmChatMessage[];
+    temperature?: number;
+    maxTokens?: number;
+    onDelta: (delta: string) => void;
+  }): Promise<string> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let streamedSomething = false;
+      try {
+        return await this.chatCompletionStreamOnce({
+          ...input,
+          onDelta: (delta) => {
+            streamedSomething = true;
+            input.onDelta(delta);
+          }
+        });
+      } catch (error) {
+        lastError = error;
+        // If the provider already streamed partial text, do not retry because
+        // the UI would duplicate text from the second attempt.
+        if (streamedSomething || attempt >= 2 || !isRetriableLlmError(error)) break;
+        await sleep(LLM_RETRY_DELAYS_MS[Math.min(attempt, LLM_RETRY_DELAYS_MS.length - 1)]);
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async chatCompletionStreamOnce(input: {
     model: string;
     messages: LlmChatMessage[];
     temperature?: number;

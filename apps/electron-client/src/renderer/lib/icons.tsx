@@ -11,6 +11,7 @@ import {
   KeyRound,
   Link,
   Loader2,
+  MonitorPlay,
   MessageCircle,
   Mic2,
   Pause,
@@ -50,7 +51,8 @@ export type IconName =
   | 'close'
   | 'chat'
   | 'refresh'
-  | 'copy';
+  | 'copy'
+  | 'preview';
 
 const icons: Record<IconName, ComponentType<SVGProps<SVGSVGElement>>> = {
   spark: Sparkles,
@@ -76,7 +78,8 @@ const icons: Record<IconName, ComponentType<SVGProps<SVGSVGElement>>> = {
   close: X,
   chat: MessageCircle,
   refresh: RefreshCw,
-  copy: Copy
+  copy: Copy,
+  preview: MonitorPlay
 };
 
 export function Icon({ name, className, ...props }: { name: IconName; className?: string } & SVGProps<SVGSVGElement>) {

@@ -24,6 +24,7 @@ declare global {
         body: string;
       }>;
       clipboardWriteText?: (text: string) => Promise<boolean>;
+      openHtmlPreview?: (html: string) => Promise<boolean>;
       httpStream?: (
         request: {
           url: string;
