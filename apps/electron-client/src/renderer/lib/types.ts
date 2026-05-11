@@ -10,6 +10,7 @@ export interface AppSettings {
   autoPlay: boolean;
   saveHistory: boolean;
   lastRoute: RoutePath;
+  modelReturnRoute: RoutePath | '';
   llmApiUrl: string;
   llmToken: string;
   llmUseToken: boolean;

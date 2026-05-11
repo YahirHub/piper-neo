@@ -35,8 +35,9 @@ export function ModelsPage({ settings, updateSettings, navigate }: { settings: A
   });
 
   function select(model: PiperModel) {
-    updateSettings({ selectedModel: model.file, lastRoute: '/' });
-    navigate('/');
+    const target = settings.modelReturnRoute || '/';
+    updateSettings({ selectedModel: model.file, lastRoute: target, modelReturnRoute: '' });
+    navigate(target);
   }
 
   return (

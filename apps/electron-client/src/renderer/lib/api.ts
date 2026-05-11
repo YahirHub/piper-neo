@@ -12,6 +12,39 @@ export class PiperApiError extends Error {
   }
 }
 
+
+const RETRY_DELAYS_MS = [420, 1100];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isRetriablePiperError(error: unknown): boolean {
+  if (error instanceof PiperApiError) {
+    if (error.status && [401, 403, 404].includes(error.status)) return false;
+    return ['timeout', 'network_error', 'audio_download_failed', 'image_failed', 'request_failed'].includes(error.code)
+      || Boolean(error.status && (error.status === 408 || error.status === 429 || error.status >= 500));
+  }
+
+  return true;
+}
+
+async function withRetry<T>(operation: () => Promise<T>, attempts = 3): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (attempt >= attempts - 1 || !isRetriablePiperError(error)) break;
+      await sleep(RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)]);
+    }
+  }
+
+  throw lastError;
+}
+
 export interface PiperClientOptions {
   apiUrl: string;
   token?: string;
@@ -110,23 +143,25 @@ export class PiperApiClient {
   }
 
   async models(): Promise<ModelsPayload> {
-    return await this.request<ModelsPayload>('/api/v1/models?include=metadata', undefined, 15000);
+    return await withRetry(() => this.request<ModelsPayload>('/api/v1/models?include=metadata', undefined, 15000));
   }
 
   async modelImage(imageUrl: string): Promise<Blob> {
-    const url = imageUrl.startsWith('http') ? imageUrl : `${this.baseUrl}${imageUrl}`;
-    const response = await fetch(url, {
-      headers: this.headers({ Accept: 'image/*' })
-    });
+    return await withRetry(async () => {
+      const url = imageUrl.startsWith('http') ? imageUrl : `${this.baseUrl}${imageUrl}`;
+      const response = await fetch(url, {
+        headers: this.headers({ Accept: 'image/*' })
+      });
 
-    if (!response.ok) {
-      if (response.status === 401) {
-        throw new PiperApiError('La API rechazó el token al cargar la imagen.', 'invalid_token', 401);
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new PiperApiError('La API rechazó el token al cargar la imagen.', 'invalid_token', 401);
+        }
+        throw new PiperApiError('No se pudo cargar la imagen del modelo.', 'image_failed', response.status);
       }
-      throw new PiperApiError('No se pudo cargar la imagen del modelo.', 'image_failed', response.status);
-    }
 
-    return await response.blob();
+      return await response.blob();
+    });
   }
 
   async synthesize(input: { text: string; model: string; speakerId?: number }): Promise<TtsPayload> {
@@ -143,7 +178,7 @@ export class PiperApiClient {
       body.speaker_id = input.speakerId;
     }
 
-    return await this.request<TtsPayload>(
+    return await withRetry(() => this.request<TtsPayload>(
       '/api/v1/tts',
       {
         method: 'POST',
@@ -151,22 +186,24 @@ export class PiperApiClient {
         body: JSON.stringify(body)
       },
       120000
-    );
+    ));
   }
 
   async audio(audioUrl: string): Promise<Blob> {
-    const url = audioUrl.startsWith('http') ? audioUrl : `${this.baseUrl}${audioUrl}`;
-    const response = await fetch(url, {
-      headers: this.headers({ Accept: 'audio/wav,audio/*' })
-    });
+    return await withRetry(async () => {
+      const url = audioUrl.startsWith('http') ? audioUrl : `${this.baseUrl}${audioUrl}`;
+      const response = await fetch(url, {
+        headers: this.headers({ Accept: 'audio/wav,audio/*' })
+      });
 
-    if (!response.ok) {
-      if (response.status === 401) {
-        throw new PiperApiError('La API rechazó el token al descargar el audio.', 'invalid_token', 401);
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new PiperApiError('La API rechazó el token al descargar el audio.', 'invalid_token', 401);
+        }
+        throw new PiperApiError('El audio fue generado, pero no se pudo descargar.', 'audio_download_failed', response.status);
       }
-      throw new PiperApiError('El audio fue generado, pero no se pudo descargar.', 'audio_download_failed', response.status);
-    }
 
-    return await response.blob();
+      return await response.blob();
+    });
   }
 }

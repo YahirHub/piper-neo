@@ -3,6 +3,7 @@ import type { PiperModel } from '../lib/types';
 import { PiperApiClient } from '../lib/api';
 import { Icon } from '../lib/icons';
 import { formatBytes, modelDisplayName, modelLanguage } from '../lib/format';
+import { getCachedModelImage, modelImageCacheKey, setCachedModelImage } from '../lib/modelImageCache';
 
 export function ModelCard({ model, selected, client, onSelect }: { model: PiperModel; selected: boolean; client: PiperApiClient; onSelect: () => void }) {
   const [imageUrl, setImageUrl] = useState('');
@@ -11,12 +12,29 @@ export function ModelCard({ model, selected, client, onSelect }: { model: PiperM
     let alive = true;
     let objectUrl = '';
 
+    async function useBlob(blob: Blob) {
+      if (!alive) return;
+      objectUrl = URL.createObjectURL(blob);
+      setImageUrl(objectUrl);
+    }
+
     async function load() {
       if (!model.image_url && !model.has_image) return;
+
+      const fallbackUrl = `/api/v1/models/${encodeURIComponent(model.file)}/image`;
+      const sourceUrl = model.image_url || fallbackUrl;
+      const cacheKey = modelImageCacheKey(client.baseUrl, model.file, sourceUrl);
+
+      const cached = await getCachedModelImage(cacheKey);
+      if (cached) {
+        await useBlob(cached);
+        return;
+      }
+
       try {
-        const blob = await client.modelImage(model.image_url || `/api/v1/models/${encodeURIComponent(model.file)}/image`);
-        objectUrl = URL.createObjectURL(blob);
-        if (alive) setImageUrl(objectUrl);
+        const blob = await client.modelImage(sourceUrl);
+        await setCachedModelImage(cacheKey, blob);
+        await useBlob(blob);
       } catch {
         if (alive) setImageUrl('');
       }
