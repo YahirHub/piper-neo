@@ -1,4 +1,4 @@
-export type RoutePath = '/' | '/setup' | '/models' | '/history' | '/settings';
+export type RoutePath = '/' | '/setup' | '/models' | '/chat' | '/history' | '/settings';
 
 export interface AppSettings {
   apiUrl: string;
@@ -10,7 +10,17 @@ export interface AppSettings {
   autoPlay: boolean;
   saveHistory: boolean;
   lastRoute: RoutePath;
+  llmApiUrl: string;
+  llmToken: string;
+  llmUseToken: boolean;
+  llmModel: string;
+  llmManualModel: string;
+  llmSystemPrompt: string;
+  llmTemperature: number;
+  llmMaxTokens: number;
+  llmContextMessages: number;
 }
+
 
 export interface PiperResponse<T> {
   success: boolean;
@@ -120,4 +130,50 @@ export interface AudioHistoryItem {
   audioSeconds?: number;
   inferSeconds?: number;
   realTimeFactor?: number;
+}
+
+export type LlmRole = 'system' | 'user' | 'assistant';
+
+export interface LlmChatMessage {
+  role: LlmRole;
+  content: string;
+}
+
+export interface LlmModelInfo {
+  id: string;
+  object?: string;
+  created?: number;
+  owned_by?: string;
+}
+
+export interface LlmModelListResponse {
+  object?: string;
+  data: LlmModelInfo[];
+}
+
+export interface ChatAudioMeta {
+  file: string;
+  model: string;
+  url: string;
+  format: string;
+  bytes?: number;
+  audioSeconds?: number;
+  inferSeconds?: number;
+  realTimeFactor?: number;
+  createdAt: number;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  createdAt: number;
+  llmModel?: string;
+  piperModel?: string;
+  audio?: ChatAudioMeta;
+  error?: string;
+}
+
+export interface ChatAudioState {
+  blobs: Record<string, Blob>;
 }
