@@ -271,3 +271,6 @@ Default API flow:
 3. Configure API URL and optional token.
 4. Select a model from `/api/v1/models?include=metadata`.
 5. Generate audio from the studio screen.
+6. Use Live chat to connect any OpenAI-compatible `/v1` LLM provider, list or type a model manually, and narrate assistant responses with the selected Piper Neo voice.
+
+The Live chat screen persists the conversation while navigating across pages, sends the configured system prompt plus recent context to the LLM provider, supports new chat/regenerate, and adds a play button below each assistant message.

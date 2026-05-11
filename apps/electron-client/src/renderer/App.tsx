@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { isRoutePath, loadSettings, saveSettings } from './lib/settings';
-import type { AppSettings, CurrentAudioState, RoutePath } from './lib/types';
+import type { AppSettings, ChatAudioState, CurrentAudioState, RoutePath } from './lib/types';
 import { Shell } from './components/Shell';
 import { Onboarding } from './components/Onboarding';
 import { ModelsPage } from './components/ModelsPage';
 import { StudioPage } from './components/StudioPage';
 import { HistoryPage } from './components/HistoryPage';
+import { ChatPage } from './components/ChatPage';
 import { SettingsPage } from './components/SettingsPage';
 import { SplashScreen } from './components/SplashScreen';
 
@@ -37,6 +38,7 @@ export function App() {
     blob: null,
     text: ''
   });
+  const [chatAudio, setChatAudio] = useState<ChatAudioState>({ blobs: {} });
 
   useEffect(() => {
     const timer = window.setTimeout(() => setShowSplash(false), 1700);
@@ -86,6 +88,16 @@ export function App() {
     switch (route) {
       case '/models':
         return <ModelsPage settings={settings} updateSettings={updateSettings} navigate={navigate} />;
+      case '/chat':
+        return (
+          <ChatPage
+            settings={settings}
+            updateSettings={updateSettings}
+            navigate={navigate}
+            chatAudioBlobs={chatAudio.blobs}
+            setChatAudioBlobs={(blobs) => setChatAudio({ blobs })}
+          />
+        );
       case '/history':
         return <HistoryPage />;
       case '/settings':
@@ -94,10 +106,14 @@ export function App() {
       default:
         return <StudioPage settings={settings} updateSettings={updateSettings} navigate={navigate} currentAudio={currentAudio} setCurrentAudio={setCurrentAudio} />;
     }
-  }, [route, settings, currentAudio]);
+  }, [route, settings, currentAudio, chatAudio]);
 
   if (showSplash) {
     return <SplashScreen />;
+  }
+
+  if (settings.connected && route === '/chat') {
+    return <>{page}</>;
   }
 
   return (

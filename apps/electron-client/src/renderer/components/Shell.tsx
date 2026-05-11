@@ -6,6 +6,7 @@ import { Brand } from './Brand';
 const nav: Array<{ path: RoutePath; label: string; icon: IconName }> = [
   { path: '/', label: 'Estudio', icon: 'mic' },
   { path: '/models', label: 'Modelos', icon: 'models' },
+  { path: '/chat', label: 'Live chat', icon: 'chat' },
   { path: '/history', label: 'Historial', icon: 'history' },
   { path: '/settings', label: 'Ajustes', icon: 'settings' }
 ];
