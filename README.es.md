@@ -179,6 +179,8 @@ python TTS/bin/resample.py \
 
 ## Documentación
 
+- [Filtro y sanitizado de texto para TTS](docs/text-preprocessing.md)
+
 - `README.md`: documentación en inglés.
 - `docs/api-server.md`: documentación completa del servidor HTTP.
 - `docs/new-piper-usage.md`: uso CLI, archivos de texto y chunks inteligentes.

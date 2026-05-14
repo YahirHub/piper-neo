@@ -183,6 +183,8 @@ python TTS/bin/resample.py \
 
 ## Documentation
 
+- [Text preprocessing and sanitizer](docs/text-preprocessing.md)
+
 - `README.es.md`: Spanish documentation.
 - `docs/api-server.md`: full HTTP API documentation.
 - `docs/new-piper-usage.md`: CLI usage, text files and smart chunking.
