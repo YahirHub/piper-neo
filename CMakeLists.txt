@@ -27,7 +27,11 @@ elseif(NOT APPLE)
 endif()
 
 add_executable(piper src/cpp/main.cpp src/cpp/piper.cpp src/cpp/server.cpp src/cpp/neo_model.cpp)
-add_executable(test_piper src/cpp/test.cpp src/cpp/piper.cpp)
+
+option(PIPER_BUILD_TESTS "Build the optional Piper test executable" OFF)
+if(PIPER_BUILD_TESTS)
+  add_executable(test_piper src/cpp/test.cpp src/cpp/piper.cpp)
+endif()
 
 # NOTE: external project prefix are shortened because of path length restrictions on Windows
 # NOTE: onnxruntime is pulled from piper-phonemize
@@ -47,7 +51,9 @@ if(NOT DEFINED FMT_DIR)
     CMAKE_ARGS -DFMT_TEST:BOOL=OFF  # Don't build all the tests
   )
   add_dependencies(piper fmt_external)
-  add_dependencies(test_piper fmt_external)
+  if(PIPER_BUILD_TESTS)
+    add_dependencies(test_piper fmt_external)
+  endif()
 endif()
 
 # ---- spdlog ---
@@ -62,7 +68,9 @@ if(NOT DEFINED SPDLOG_DIR)
     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${SPDLOG_DIR}
   )
   add_dependencies(piper spdlog_external)
-  add_dependencies(test_piper spdlog_external)
+  if(PIPER_BUILD_TESTS)
+    add_dependencies(test_piper spdlog_external)
+  endif()
 endif()
 
 # ---- piper-phonemize ---
@@ -76,7 +84,9 @@ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR}
   )
   add_dependencies(piper piper_phonemize_external)
-  add_dependencies(test_piper piper_phonemize_external)
+  if(PIPER_BUILD_TESTS)
+    add_dependencies(test_piper piper_phonemize_external)
+  endif()
 endif()
 
 # ---- Declare executable ----
@@ -143,37 +153,45 @@ target_include_directories(piper PUBLIC
 
 target_compile_definitions(piper PUBLIC _PIPER_VERSION=${piper_version})
 
-# ---- Declare test ----
-include(CTest)
-enable_testing()
-add_test(
-  NAME test_piper
-  COMMAND test_piper "${CMAKE_SOURCE_DIR}/etc/test_voice.onnx" "${PIPER_PHONEMIZE_DIR}/share/espeak-ng-data" "${CMAKE_CURRENT_BINARY_DIR}/test.wav"
-)
+# ---- Declare optional tests ----
+if(PIPER_BUILD_TESTS)
+  include(CTest)
+  enable_testing()
 
-target_compile_features(test_piper PUBLIC cxx_std_17)
+  set(PIPER_TEST_VOICE "${CMAKE_SOURCE_DIR}/etc/test_voice.onnx" CACHE FILEPATH "Optional ONNX voice used by ctest")
+  if(EXISTS "${PIPER_TEST_VOICE}")
+    add_test(
+      NAME test_piper
+      COMMAND test_piper "${PIPER_TEST_VOICE}" "${PIPER_PHONEMIZE_DIR}/share/espeak-ng-data" "${CMAKE_CURRENT_BINARY_DIR}/test.wav"
+    )
+  else()
+    message(WARNING "PIPER_BUILD_TESTS is ON, but PIPER_TEST_VOICE was not found. test_piper will build, but ctest will not register the sample voice test.")
+  endif()
 
-target_include_directories(
-  test_piper PUBLIC
-  ${FMT_DIR}/include
-  ${SPDLOG_DIR}/include
-  ${PIPER_PHONEMIZE_DIR}/include
-)
+  target_compile_features(test_piper PUBLIC cxx_std_17)
 
-target_link_directories(
-  test_piper PUBLIC
-  ${FMT_DIR}/lib
-  ${SPDLOG_DIR}/lib
-  ${PIPER_PHONEMIZE_DIR}/lib
-)
+  target_include_directories(
+    test_piper PUBLIC
+    ${FMT_DIR}/include
+    ${SPDLOG_DIR}/include
+    ${PIPER_PHONEMIZE_DIR}/include
+  )
 
-target_link_libraries(test_piper PUBLIC
-  fmt
-  spdlog
-  espeak-ng
-  piper_phonemize
-  onnxruntime
-)
+  target_link_directories(
+    test_piper PUBLIC
+    ${FMT_DIR}/lib
+    ${SPDLOG_DIR}/lib
+    ${PIPER_PHONEMIZE_DIR}/lib
+  )
+
+  target_link_libraries(test_piper PUBLIC
+    fmt
+    spdlog
+    espeak-ng
+    piper_phonemize
+    onnxruntime
+  )
+endif()
 
 # ---- Declare install targets ----
 

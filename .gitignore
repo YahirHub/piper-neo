@@ -37,3 +37,15 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Runtime/server outputs
+outputs/
+outputs/tmp/
+
+# Local downloaded voices/models; keep the placeholder directory only
+models/*
+!models/.gitkeep
+
+# Optional sample model removed from source ZIPs to keep the repository light
+etc/test_voice.onnx
+etc/test_voice.onnx.json
