@@ -76,6 +76,18 @@ curl -X POST http://127.0.0.1:8080/api/v1/tts \
 
 La API genera automáticamente un nombre seguro para el archivo. El parámetro `output_file` ya no está soportado en la API HTTP.
 
+El mismo endpoint también soporta guiones multi-voz con etiquetas locales, sin romper compatibilidad con clientes anteriores:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"default_model":"Narrador","text":"<model=\"Elena\" speaker=\"0\">Hola.</model><silence ms=\"500\"/><model=\"Juan\" length_scale=\"1.1\">Mucho gusto.</model>"}'
+```
+
+En este modo, el WAV final usa automáticamente el sample rate más alto entre los modelos usados y normaliza los segmentos antes de escribir un único archivo PCM válido.
+
+Más detalles en `docs/markup-tts.md`.
+
 Descargar el audio desde la URL devuelta:
 
 ```bash

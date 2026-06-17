@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cerrno>
+#include <cstring>
 #include <limits>
 #include <cstdlib>
 #include <filesystem>
@@ -1599,6 +1600,10 @@ struct TtsJobRequest {
   std::filesystem::path outputPath;
   std::optional<std::string> requestedModel;
   std::optional<piper::SpeakerId> speakerId;
+  std::optional<float> noiseScale;
+  std::optional<float> lengthScale;
+  std::optional<float> noiseW;
+  std::optional<float> sentenceSilenceSeconds;
   std::function<bool()> shouldCancel;
 };
 
@@ -1675,6 +1680,10 @@ public:
     job->outputPath = request.outputPath;
     job->requestedModel = request.requestedModel;
     job->speakerId = request.speakerId;
+    job->noiseScale = request.noiseScale;
+    job->lengthScale = request.lengthScale;
+    job->noiseW = request.noiseW;
+    job->sentenceSilenceSeconds = request.sentenceSilenceSeconds;
     job->shouldCancel = request.shouldCancel;
     job->pendingChunks = job->textChunks.size();
     job->chunkPaths.resize(job->textChunks.size());
@@ -1810,6 +1819,10 @@ private:
     std::filesystem::path tempDir;
     std::optional<std::string> requestedModel;
     std::optional<piper::SpeakerId> speakerId;
+    std::optional<float> noiseScale;
+    std::optional<float> lengthScale;
+    std::optional<float> noiseW;
+    std::optional<float> sentenceSilenceSeconds;
     std::function<bool()> shouldCancel;
     std::vector<std::string> textChunks;
     std::vector<std::filesystem::path> chunkPaths;
@@ -1937,19 +1950,43 @@ private:
 
       auto &selectedVoice = voiceLease.get();
       const auto previousSpeakerId = selectedVoice.synthesisConfig.speakerId;
+      const auto previousNoiseScale = selectedVoice.synthesisConfig.noiseScale;
+      const auto previousLengthScale = selectedVoice.synthesisConfig.lengthScale;
+      const auto previousNoiseW = selectedVoice.synthesisConfig.noiseW;
+      const auto previousSentenceSilence = selectedVoice.synthesisConfig.sentenceSilenceSeconds;
+      auto restoreSynthesisConfig = [&]() {
+        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        selectedVoice.synthesisConfig.noiseScale = previousNoiseScale;
+        selectedVoice.synthesisConfig.lengthScale = previousLengthScale;
+        selectedVoice.synthesisConfig.noiseW = previousNoiseW;
+        selectedVoice.synthesisConfig.sentenceSilenceSeconds = previousSentenceSilence;
+      };
+
       if (job->speakerId) {
         selectedVoice.synthesisConfig.speakerId = *job->speakerId;
+      }
+      if (job->noiseScale) {
+        selectedVoice.synthesisConfig.noiseScale = *job->noiseScale;
+      }
+      if (job->lengthScale) {
+        selectedVoice.synthesisConfig.lengthScale = *job->lengthScale;
+      }
+      if (job->noiseW) {
+        selectedVoice.synthesisConfig.noiseW = *job->noiseW;
+      }
+      if (job->sentenceSilenceSeconds) {
+        selectedVoice.synthesisConfig.sentenceSilenceSeconds = *job->sentenceSilenceSeconds;
       }
 
       const auto chunkPath = job->tempDir / ("chunk_" + std::to_string(index) + ".raw");
       if (shouldCancel()) {
-        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        restoreSynthesisConfig();
         throw std::runtime_error("synthesis_cancelled");
       }
 
       std::ofstream chunkFile(chunkPath, std::ios::binary);
       if (!chunkFile.good()) {
-        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        restoreSynthesisConfig();
         throw std::runtime_error("Could not open chunk temp file");
       }
 
@@ -1975,10 +2012,10 @@ private:
         piper::textToAudio(piperConfig, selectedVoice, job->textChunks[index], audioBuffer,
                            chunkResult, audioCallback, shouldCancel);
       } catch (...) {
-        selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+        restoreSynthesisConfig();
         throw;
       }
-      selectedVoice.synthesisConfig.speakerId = previousSpeakerId;
+      restoreSynthesisConfig();
       chunkFile.close();
 
       {
@@ -2094,6 +2131,600 @@ private:
   std::size_t waitingJobs = 0;
 };
 
+
+struct MarkupVoiceSettings {
+  std::optional<std::string> model;
+  std::optional<piper::SpeakerId> speakerId;
+  std::optional<float> noiseScale;
+  std::optional<float> lengthScale;
+  std::optional<float> noiseW;
+  std::optional<float> sentenceSilenceSeconds;
+};
+
+struct MarkupSegment {
+  enum class Type { Speech, Silence };
+  Type type = Type::Speech;
+  std::string text;
+  std::uint64_t silenceMs = 0;
+  MarkupVoiceSettings voice;
+};
+
+struct MarkupParseResult {
+  std::vector<MarkupSegment> segments;
+  std::vector<std::string> warnings;
+};
+
+struct MarkupRenderResult {
+  TtsJobResult tts;
+  json segments = json::array();
+  std::size_t speechSegments = 0;
+  std::size_t silenceSegments = 0;
+  int outputSampleRate = 0;
+};
+
+bool looksLikeMarkupTts(const std::string &text) {
+  const auto lower = lowerCopy(text);
+  return lower.find("<model=") != std::string::npos ||
+         lower.find("<model ") != std::string::npos ||
+         lower.find("</model>") != std::string::npos ||
+         lower.find("<silence") != std::string::npos;
+}
+
+std::map<std::string, std::string> parseLooseTagAttributes(const std::string &tagBody) {
+  std::map<std::string, std::string> attrs;
+  static const std::regex attrRegex(R"(([A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'))");
+  for (std::sregex_iterator it(tagBody.begin(), tagBody.end(), attrRegex), end; it != end; ++it) {
+    const auto key = lowerCopy((*it)[1].str());
+    const auto value = (*it)[2].matched ? (*it)[2].str() : (*it)[3].str();
+    attrs[key] = value;
+  }
+  return attrs;
+}
+
+std::optional<float> parseMarkupFloat(const std::string &value, const std::string &field,
+                                      float minValue, float maxValue) {
+  try {
+    std::size_t used = 0;
+    const auto parsed = std::stof(trimCopy(value), &used);
+    if (used != trimCopy(value).size() || parsed < minValue || parsed > maxValue) {
+      throw std::runtime_error("invalid");
+    }
+    return parsed;
+  } catch (...) {
+    throw std::runtime_error("markup_invalid_" + field);
+  }
+}
+
+std::optional<piper::SpeakerId> parseMarkupSpeaker(const std::string &value) {
+  try {
+    std::size_t used = 0;
+    const auto trimmed = trimCopy(value);
+    const auto parsed = std::stoll(trimmed, &used);
+    if (used != trimmed.size() || parsed < 0) {
+      throw std::runtime_error("invalid");
+    }
+    return static_cast<piper::SpeakerId>(parsed);
+  } catch (...) {
+    throw std::runtime_error("markup_invalid_speaker");
+  }
+}
+
+std::optional<std::uint64_t> parseSilenceDurationMs(const std::map<std::string, std::string> &attrs) {
+  auto byKey = [&](const std::string &key) -> std::optional<std::string> {
+    const auto it = attrs.find(key);
+    if (it == attrs.end()) return std::nullopt;
+    return trimCopy(it->second);
+  };
+
+  if (auto value = byKey("ms")) {
+    auto parsed = parseMarkupFloat(*value, "silence", 0.0f, 60.0f * 60.0f * 1000.0f);
+    return static_cast<std::uint64_t>(*parsed + 0.5f);
+  }
+
+  if (auto value = byKey("sec")) {
+    auto parsed = parseMarkupFloat(*value, "silence", 0.0f, 60.0f * 60.0f);
+    return static_cast<std::uint64_t>((*parsed * 1000.0f) + 0.5f);
+  }
+
+  if (auto value = byKey("seconds")) {
+    auto parsed = parseMarkupFloat(*value, "silence", 0.0f, 60.0f * 60.0f);
+    return static_cast<std::uint64_t>((*parsed * 1000.0f) + 0.5f);
+  }
+
+  if (auto value = byKey("silence")) {
+    auto v = lowerCopy(trimCopy(*value));
+    if (v.size() > 2 && v.substr(v.size() - 2) == "ms") {
+      auto parsed = parseMarkupFloat(v.substr(0, v.size() - 2), "silence", 0.0f, 60.0f * 60.0f * 1000.0f);
+      return static_cast<std::uint64_t>(*parsed + 0.5f);
+    }
+    if (v.size() > 1 && v.back() == 's') {
+      auto parsed = parseMarkupFloat(v.substr(0, v.size() - 1), "silence", 0.0f, 60.0f * 60.0f);
+      return static_cast<std::uint64_t>((*parsed * 1000.0f) + 0.5f);
+    }
+    auto parsed = parseMarkupFloat(v, "silence", 0.0f, 60.0f * 60.0f * 1000.0f);
+    return static_cast<std::uint64_t>(*parsed + 0.5f);
+  }
+
+  return std::nullopt;
+}
+
+MarkupVoiceSettings parseMarkupModelSettings(const std::map<std::string, std::string> &attrs) {
+  const auto modelIt = attrs.find("model");
+  if (modelIt == attrs.end() || trimCopy(modelIt->second).empty()) {
+    throw std::runtime_error("markup_model_missing");
+  }
+
+  MarkupVoiceSettings settings;
+  auto modelName = trimCopy(modelIt->second);
+  const auto hashPos = modelName.rfind('#');
+  if (hashPos != std::string::npos && hashPos + 1 < modelName.size()) {
+    settings.speakerId = parseMarkupSpeaker(modelName.substr(hashPos + 1));
+    modelName = trimCopy(modelName.substr(0, hashPos));
+  }
+  settings.model = modelName;
+
+  auto speakerIt = attrs.find("speaker");
+  if (speakerIt == attrs.end()) {
+    speakerIt = attrs.find("speacker");
+  }
+  if (speakerIt != attrs.end()) {
+    settings.speakerId = parseMarkupSpeaker(speakerIt->second);
+  }
+
+  auto setFloat = [&](const std::vector<std::string> &keys, std::optional<float> &target,
+                      const std::string &field, float minValue, float maxValue) {
+    for (const auto &key : keys) {
+      const auto it = attrs.find(key);
+      if (it != attrs.end()) {
+        target = parseMarkupFloat(it->second, field, minValue, maxValue);
+        return;
+      }
+    }
+  };
+
+  setFloat({"noise_scale", "noisescale"}, settings.noiseScale, "noise_scale", 0.0f, 2.0f);
+  setFloat({"length_scale", "lengthscale"}, settings.lengthScale, "length_scale", 0.05f, 10.0f);
+  setFloat({"noise_w", "noisew"}, settings.noiseW, "noise_w", 0.0f, 2.0f);
+  setFloat({"sentence_silence", "sentence_silence_sec", "sentence_silence_seconds", "sentencesilence"},
+           settings.sentenceSilenceSeconds, "sentence_silence", 0.0f, 30.0f);
+
+  return settings;
+}
+
+MarkupParseResult parseMarkupScript(const std::string &text) {
+  MarkupParseResult result;
+  MarkupVoiceSettings activeVoice;
+  std::string buffer;
+
+  auto flushSpeech = [&]() {
+    const auto spoken = trimCopy(buffer);
+    if (!spoken.empty()) {
+      MarkupSegment segment;
+      segment.type = MarkupSegment::Type::Speech;
+      segment.text = spoken;
+      segment.voice = activeVoice;
+      result.segments.push_back(std::move(segment));
+    }
+    buffer.clear();
+  };
+
+  for (std::size_t i = 0; i < text.size();) {
+    if (text[i] != '<') {
+      buffer.push_back(text[i]);
+      ++i;
+      continue;
+    }
+
+    const auto end = text.find('>', i + 1);
+    if (end == std::string::npos) {
+      buffer.append(text.substr(i));
+      break;
+    }
+
+    const auto rawTag = text.substr(i, end - i + 1);
+    const auto lowerTag = lowerCopy(rawTag);
+    if (lowerTag.rfind("<model", 0) == 0 && lowerTag.rfind("</model", 0) != 0) {
+      flushSpeech();
+      auto tagBody = rawTag.substr(1, rawTag.size() - 2);
+      if (!tagBody.empty() && tagBody.back() == '/') {
+        tagBody.pop_back();
+      }
+      activeVoice = parseMarkupModelSettings(parseLooseTagAttributes(tagBody));
+      i = end + 1;
+      continue;
+    }
+
+    if (lowerTag.rfind("</model", 0) == 0) {
+      flushSpeech();
+      activeVoice = MarkupVoiceSettings{};
+      i = end + 1;
+      continue;
+    }
+
+    if (lowerTag.rfind("<silence", 0) == 0) {
+      flushSpeech();
+      auto tagBody = rawTag.substr(1, rawTag.size() - 2);
+      if (!tagBody.empty() && tagBody.back() == '/') {
+        tagBody.pop_back();
+      }
+      const auto durationMs = parseSilenceDurationMs(parseLooseTagAttributes(tagBody));
+      if (!durationMs) {
+        throw std::runtime_error("markup_silence_missing_duration");
+      }
+      if (*durationMs > 0) {
+        MarkupSegment segment;
+        segment.type = MarkupSegment::Type::Silence;
+        segment.silenceMs = *durationMs;
+        result.segments.push_back(std::move(segment));
+      }
+      i = end + 1;
+      continue;
+    }
+
+    buffer.append(rawTag);
+    i = end + 1;
+  }
+
+  flushSpeech();
+  return result;
+}
+
+std::optional<float> requestFloatOption(const json &input, const std::vector<std::string> &keys,
+                                        const std::string &field, float minValue,
+                                        float maxValue) {
+  for (const auto &key : keys) {
+    if (!input.contains(key)) {
+      continue;
+    }
+    if (!input[key].is_number()) {
+      throw std::runtime_error("invalid_request_" + field);
+    }
+    const auto value = input[key].get<float>();
+    if (value < minValue || value > maxValue) {
+      throw std::runtime_error("invalid_request_" + field);
+    }
+    return value;
+  }
+  return std::nullopt;
+}
+
+json markupVoiceSettingsJson(const MarkupVoiceSettings &settings, const std::optional<std::string> &fallbackModel,
+                             const std::optional<piper::SpeakerId> &fallbackSpeaker) {
+  json out;
+  out["model"] = settings.model.value_or(fallbackModel.value_or("<default>"));
+  if (settings.speakerId) {
+    out["speaker"] = *settings.speakerId;
+  } else if (fallbackSpeaker) {
+    out["speaker"] = *fallbackSpeaker;
+  } else {
+    out["speaker"] = nullptr;
+  }
+  if (settings.noiseScale) out["noise_scale"] = *settings.noiseScale;
+  if (settings.lengthScale) out["length_scale"] = *settings.lengthScale;
+  if (settings.noiseW) out["noise_w"] = *settings.noiseW;
+  if (settings.sentenceSilenceSeconds) out["sentence_silence"] = *settings.sentenceSilenceSeconds;
+  return out;
+}
+
+struct WavPayload {
+  int sampleRate = 0;
+  int sampleWidth = 0;
+  int channels = 0;
+  std::string pcm;
+};
+
+std::uint16_t readLe16(const char *ptr) {
+  return static_cast<std::uint16_t>(static_cast<unsigned char>(ptr[0])) |
+         static_cast<std::uint16_t>(static_cast<unsigned char>(ptr[1]) << 8);
+}
+
+std::uint32_t readLe32(const char *ptr) {
+  return static_cast<std::uint32_t>(static_cast<unsigned char>(ptr[0])) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(ptr[1])) << 8) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(ptr[2])) << 16) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(ptr[3])) << 24);
+}
+
+WavPayload readServerWavPayload(const std::filesystem::path &path) {
+  std::ifstream file(path, std::ios::binary);
+  if (!file.good()) {
+    throw std::runtime_error("markup_missing_segment_wav");
+  }
+
+  std::string header(44, '\0');
+  file.read(header.data(), static_cast<std::streamsize>(header.size()));
+  if (file.gcount() != static_cast<std::streamsize>(header.size()) ||
+      header.compare(0, 4, "RIFF") != 0 || header.compare(8, 4, "WAVE") != 0 ||
+      header.compare(12, 4, "fmt ") != 0 || header.compare(36, 4, "data") != 0) {
+    throw std::runtime_error("markup_invalid_segment_wav");
+  }
+
+  WavPayload payload;
+  payload.channels = static_cast<int>(readLe16(header.data() + 22));
+  payload.sampleRate = static_cast<int>(readLe32(header.data() + 24));
+  payload.sampleWidth = static_cast<int>(readLe16(header.data() + 34) / 8);
+  const auto dataSize = readLe32(header.data() + 40);
+  payload.pcm.resize(dataSize);
+  file.read(payload.pcm.data(), static_cast<std::streamsize>(payload.pcm.size()));
+  if (file.gcount() != static_cast<std::streamsize>(payload.pcm.size())) {
+    throw std::runtime_error("markup_truncated_segment_wav");
+  }
+  return payload;
+}
+
+struct MarkupAudioPart {
+  bool silence = false;
+  std::string pcm;
+  std::uint64_t silenceMs = 0;
+  int sourceSampleRate = 0;
+  std::string modelName;
+  MarkupVoiceSettings settings;
+  std::string text;
+};
+
+std::uint64_t silenceBytesForMs(std::uint64_t ms, int sampleRate, int sampleWidth, int channels) {
+  const std::uint64_t blockAlign = static_cast<std::uint64_t>(std::max(1, sampleWidth) * std::max(1, channels));
+  const std::uint64_t bytes = (static_cast<std::uint64_t>(sampleRate) * blockAlign * ms) / 1000;
+  return bytes - (bytes % blockAlign);
+}
+
+void writeZeroBytes(std::ostream &out, std::uint64_t bytes) {
+  std::array<char, 64 * 1024> zero{};
+  while (bytes > 0) {
+    const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(bytes, zero.size()));
+    out.write(zero.data(), static_cast<std::streamsize>(count));
+    bytes -= count;
+  }
+}
+
+
+void writeLe16ToString(std::string &out, std::size_t offset, std::int32_t value) {
+  const auto clamped = std::max<std::int32_t>(std::numeric_limits<std::int16_t>::min(),
+                                             std::min<std::int32_t>(std::numeric_limits<std::int16_t>::max(), value));
+  const auto sample = static_cast<std::uint16_t>(static_cast<std::int16_t>(clamped));
+  out[offset] = static_cast<char>(sample & 0xFF);
+  out[offset + 1] = static_cast<char>((sample >> 8) & 0xFF);
+}
+
+std::string resamplePcmS16Linear(const std::string &pcm, int sourceSampleRate, int targetSampleRate,
+                                 int sampleWidth, int channels) {
+  if (sourceSampleRate == targetSampleRate) {
+    return pcm;
+  }
+  if (sourceSampleRate <= 0 || targetSampleRate <= 0 || channels <= 0 || sampleWidth != 2) {
+    throw std::runtime_error("markup_audio_resample_failed");
+  }
+
+  const auto blockAlign = static_cast<std::size_t>(sampleWidth * channels);
+  if (blockAlign == 0 || (pcm.size() % blockAlign) != 0) {
+    throw std::runtime_error("markup_audio_resample_failed");
+  }
+
+  const auto sourceFrames = pcm.size() / blockAlign;
+  if (sourceFrames == 0) {
+    return {};
+  }
+
+  const auto targetFrames = std::max<std::size_t>(
+      1, static_cast<std::size_t>((static_cast<long double>(sourceFrames) *
+                                   static_cast<long double>(targetSampleRate) /
+                                   static_cast<long double>(sourceSampleRate)) + 0.5L));
+  std::string out(targetFrames * blockAlign, '\0');
+
+  auto sampleAt = [&](std::size_t frame, int channel) -> std::int16_t {
+    const auto offset = (frame * static_cast<std::size_t>(channels) + static_cast<std::size_t>(channel)) * 2;
+    return static_cast<std::int16_t>(readLe16(pcm.data() + offset));
+  };
+
+  for (std::size_t frame = 0; frame < targetFrames; ++frame) {
+    const long double sourcePosition = (static_cast<long double>(frame) *
+                                        static_cast<long double>(sourceSampleRate)) /
+                                       static_cast<long double>(targetSampleRate);
+    auto baseFrame = static_cast<std::size_t>(sourcePosition);
+    if (baseFrame >= sourceFrames) {
+      baseFrame = sourceFrames - 1;
+    }
+    const auto nextFrame = std::min<std::size_t>(baseFrame + 1, sourceFrames - 1);
+    const long double fraction = sourcePosition - static_cast<long double>(baseFrame);
+
+    for (int channel = 0; channel < channels; ++channel) {
+      const auto a = static_cast<long double>(sampleAt(baseFrame, channel));
+      const auto b = static_cast<long double>(sampleAt(nextFrame, channel));
+      const auto interpolated = static_cast<std::int32_t>(a + ((b - a) * fraction));
+      const auto offset = (frame * static_cast<std::size_t>(channels) + static_cast<std::size_t>(channel)) * 2;
+      writeLe16ToString(out, offset, interpolated);
+    }
+  }
+
+  return out;
+}
+
+MarkupRenderResult synthesizeMarkupScript(const std::string &rawText, const std::string &fileName,
+                                          const std::filesystem::path &outputPath,
+                                          const std::optional<std::string> &defaultModel,
+                                          const std::optional<piper::SpeakerId> &defaultSpeakerId,
+                                          const std::optional<float> &defaultNoiseScale,
+                                          const std::optional<float> &defaultLengthScale,
+                                          const std::optional<float> &defaultNoiseW,
+                                          const std::optional<float> &defaultSentenceSilence,
+                                          const ServerOptions &options,
+                                          FairTtsScheduler &scheduler,
+                                          const std::function<bool()> &shouldCancel) {
+  const auto parsed = parseMarkupScript(rawText);
+  if (parsed.segments.empty()) {
+    throw std::runtime_error("markup_empty_script");
+  }
+
+  const auto tempId = fileName.size() > 4 && fileName.substr(fileName.size() - 4) == ".wav"
+                          ? fileName.substr(0, fileName.size() - 4)
+                          : fileName;
+  const auto tempDir = options.outputDir / "tmp" / (tempId + "_markup");
+  std::filesystem::create_directories(tempDir);
+
+  std::vector<MarkupAudioPart> parts;
+  std::vector<json> pendingSegmentJson;
+  int targetSampleRate = 0;
+  int sampleWidth = 0;
+  int channels = 0;
+  piper::SynthesisResult totalSynthesis;
+  std::size_t speechSegments = 0;
+  std::size_t silenceSegments = 0;
+
+  try {
+    for (std::size_t i = 0; i < parsed.segments.size(); ++i) {
+      const auto &segment = parsed.segments[i];
+      if (shouldCancel && shouldCancel()) {
+        throw std::runtime_error("synthesis_cancelled");
+      }
+
+      if (segment.type == MarkupSegment::Type::Silence) {
+        MarkupAudioPart part;
+        part.silence = true;
+        part.silenceMs = segment.silenceMs;
+        parts.push_back(std::move(part));
+        ++silenceSegments;
+        continue;
+      }
+
+      TtsTextSanitizeResult segmentSanitization;
+      const auto maxSafeTextChars = std::max<std::size_t>(1000, std::min<std::size_t>(50000, options.maxInputBytes));
+      const auto safeText = sanitizeTtsTextForApi(segment.text, maxSafeTextChars, segmentSanitization);
+      if (!segmentSanitization.ok || safeText.empty()) {
+        continue;
+      }
+
+      const auto segmentFileName = "segment_" + std::to_string(i) + ".wav";
+      const auto segmentPath = tempDir / segmentFileName;
+      TtsJobRequest jobRequest;
+      jobRequest.text = safeText;
+      jobRequest.fileName = segmentFileName;
+      jobRequest.outputPath = segmentPath;
+      jobRequest.requestedModel = segment.voice.model ? segment.voice.model : defaultModel;
+      jobRequest.speakerId = segment.voice.speakerId ? segment.voice.speakerId : defaultSpeakerId;
+      jobRequest.noiseScale = segment.voice.noiseScale ? segment.voice.noiseScale : defaultNoiseScale;
+      jobRequest.lengthScale = segment.voice.lengthScale ? segment.voice.lengthScale : defaultLengthScale;
+      jobRequest.noiseW = segment.voice.noiseW ? segment.voice.noiseW : defaultNoiseW;
+      jobRequest.sentenceSilenceSeconds = segment.voice.sentenceSilenceSeconds ? segment.voice.sentenceSilenceSeconds : defaultSentenceSilence;
+      jobRequest.shouldCancel = shouldCancel;
+
+      auto ttsResult = scheduler.synthesize(jobRequest);
+      auto payload = readServerWavPayload(segmentPath);
+      if (payload.pcm.empty()) {
+        continue;
+      }
+
+      if (targetSampleRate == 0) {
+        targetSampleRate = payload.sampleRate;
+        sampleWidth = payload.sampleWidth;
+        channels = payload.channels;
+      } else {
+        targetSampleRate = std::max(targetSampleRate, payload.sampleRate);
+        if (sampleWidth != payload.sampleWidth || channels != payload.channels) {
+          throw std::runtime_error("markup_audio_format_mismatch");
+        }
+      }
+
+      totalSynthesis.audioSeconds += ttsResult.synthesis.audioSeconds;
+      totalSynthesis.inferSeconds += ttsResult.synthesis.inferSeconds;
+      MarkupAudioPart part;
+      part.silence = false;
+      part.pcm = std::move(payload.pcm);
+      part.sourceSampleRate = payload.sampleRate;
+      part.modelName = ttsResult.modelName;
+      part.settings = segment.voice;
+      part.text = safeText;
+      parts.push_back(std::move(part));
+      ++speechSegments;
+    }
+
+    if (targetSampleRate == 0 || speechSegments == 0) {
+      throw std::runtime_error("markup_empty_speech");
+    }
+
+    for (auto &part : parts) {
+      if (!part.silence && part.sourceSampleRate != targetSampleRate) {
+        part.pcm = resamplePcmS16Linear(part.pcm, part.sourceSampleRate, targetSampleRate, sampleWidth, channels);
+        part.sourceSampleRate = targetSampleRate;
+      }
+    }
+
+    std::uint64_t totalDataBytes = 0;
+    for (const auto &part : parts) {
+      if (part.silence) {
+        totalDataBytes += silenceBytesForMs(part.silenceMs, targetSampleRate, sampleWidth, channels);
+      } else {
+        totalDataBytes += part.pcm.size();
+      }
+    }
+
+    if (totalDataBytes > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("Generated WAV exceeds 4 GiB. Use smaller inputs or raw output.");
+    }
+
+    std::ofstream output(outputPath, std::ios::binary);
+    if (!output.good()) {
+      throw std::runtime_error("Could not open output file");
+    }
+    writeServerWavHeader(targetSampleRate, sampleWidth, channels,
+                         static_cast<std::uint32_t>(totalDataBytes), output);
+
+    std::uint64_t cursorMs = 0;
+    json segmentsJson = json::array();
+    for (const auto &part : parts) {
+      const auto startMs = cursorMs;
+      if (part.silence) {
+        const auto zeroBytes = silenceBytesForMs(part.silenceMs, targetSampleRate, sampleWidth, channels);
+        writeZeroBytes(output, zeroBytes);
+        cursorMs += part.silenceMs;
+        segmentsJson.push_back(json{{"type", "silence"},
+                                    {"duration_ms", part.silenceMs},
+                                    {"start_ms", startMs},
+                                    {"end_ms", cursorMs}});
+      } else {
+        output.write(part.pcm.data(), static_cast<std::streamsize>(part.pcm.size()));
+        const auto blockBytesPerSecond = static_cast<double>(targetSampleRate * sampleWidth * channels);
+        const auto durationMs = static_cast<std::uint64_t>((static_cast<double>(part.pcm.size()) / blockBytesPerSecond) * 1000.0 + 0.5);
+        cursorMs += durationMs;
+        auto settingsJson = markupVoiceSettingsJson(part.settings, defaultModel, defaultSpeakerId);
+        settingsJson["resolved_model"] = part.modelName;
+        segmentsJson.push_back(json{{"type", "speech"},
+                                    {"model", part.modelName},
+                                    {"voice", settingsJson},
+                                    {"text", part.text},
+                                    {"sample_rate", targetSampleRate},
+                                    {"start_ms", startMs},
+                                    {"end_ms", cursorMs}});
+      }
+    }
+    output.close();
+
+    totalSynthesis.audioSeconds = static_cast<double>(cursorMs) / 1000.0;
+    if (totalSynthesis.audioSeconds > 0) {
+      totalSynthesis.realTimeFactor = totalSynthesis.inferSeconds / totalSynthesis.audioSeconds;
+    }
+
+    MarkupRenderResult result;
+    result.tts.fileName = fileName;
+    result.tts.outputPath = outputPath;
+    result.tts.modelName = defaultModel.value_or("<markup>");
+    result.tts.chunks = speechSegments;
+    result.tts.synthesis = totalSynthesis;
+    result.tts.bytes = std::filesystem::exists(outputPath) ? std::filesystem::file_size(outputPath) : 0;
+    result.segments = segmentsJson;
+    result.speechSegments = speechSegments;
+    result.silenceSegments = silenceSegments;
+    result.outputSampleRate = targetSampleRate;
+
+    std::error_code ignored;
+    std::filesystem::remove_all(tempDir, ignored);
+    return result;
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove_all(tempDir, ignored);
+    throw;
+  }
+}
+
 json resourcePolicyJson(const ServerOptions &options, const FairTtsScheduler &scheduler) {
   return json{{"mode", "auto"},
               {"profile", options.cpuProfile},
@@ -2136,7 +2767,7 @@ json metricsJson(const ServerMetrics &metrics, const FairTtsScheduler &scheduler
 
 
 int errorStatusForException(const std::string &error) {
-  if (error == "invalid_model") {
+  if (error == "invalid_model" || error.rfind("markup_", 0) == 0 || error.rfind("invalid_request_", 0) == 0) {
     return 400;
   }
   if (error == "model_not_found" || error == "model_config_missing") {
@@ -2155,6 +2786,12 @@ json modelErrorResponse(const std::string &error) {
   if (error == "invalid_model") {
     return errorResponse("invalid_request",
                          "El nombre del modelo es inválido. Usa solo el nombre del archivo .onnx o .neo dentro de models/.");
+  }
+  if (error.rfind("markup_", 0) == 0) {
+    return errorResponse("invalid_markup", error);
+  }
+  if (error.rfind("invalid_request_", 0) == 0) {
+    return errorResponse("invalid_request", error);
   }
   if (error == "model_not_found") {
     return errorResponse("model_not_found", "Modelo no encontrado en la carpeta models/.");
@@ -2473,26 +3110,6 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         return;
       }
 
-      TtsTextSanitizeResult sanitization;
-      const auto maxSafeTextChars = std::max<std::size_t>(1000, std::min<std::size_t>(50000, options.maxInputBytes));
-      const auto safeText = sanitizeTtsTextForApi(text, maxSafeTextChars, sanitization);
-      if (!sanitization.ok || safeText.empty()) {
-        metrics.rejectedTextInputs++;
-        sendJson(clientSocket, sanitization.warnings.empty() ? 400 : 422,
-                 errorResponse("text_not_pronounceable",
-                               "El texto no contiene contenido pronunciable seguro después del filtrado."));
-        closeSocket(clientSocket);
-        return;
-      }
-
-      metrics.sanitizedInputs++;
-      metrics.sanitizeWarnings.fetch_add(static_cast<std::uint64_t>(sanitization.warnings.size()));
-      if (!sanitization.warnings.empty()) {
-        spdlog::info("{} TTS text sanitized: raw_bytes={} speak_bytes={} warnings={} risk={}",
-                     nowIso8601(), sanitization.rawBytes, sanitization.speakBytes,
-                     sanitization.warnings.size(), sanitization.riskScore);
-      }
-
       if (input.contains("output_file") || input.contains("outputFile")) {
         sendJson(clientSocket, 400,
                  errorResponse("invalid_request",
@@ -2513,10 +3130,42 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
         }
         requestedModel = input["model"].get<std::string>();
       }
+      if (input.contains("default_model")) {
+        if (!input["default_model"].is_string()) {
+          sendJson(clientSocket, 400,
+                   errorResponse("invalid_request", "El campo default_model debe ser string."));
+          closeSocket(clientSocket);
+          return;
+        }
+        requestedModel = input["default_model"].get<std::string>();
+      }
 
       std::optional<piper::SpeakerId> speakerId;
-      if (input.contains("speaker_id") && input["speaker_id"].is_number_integer()) {
+      if (input.contains("speaker_id")) {
+        if (!input["speaker_id"].is_number_integer()) {
+          sendJson(clientSocket, 400,
+                   errorResponse("invalid_request", "El campo speaker_id debe ser entero."));
+          closeSocket(clientSocket);
+          return;
+        }
         speakerId = input["speaker_id"].get<piper::SpeakerId>();
+      }
+
+      std::optional<float> noiseScale;
+      std::optional<float> lengthScale;
+      std::optional<float> noiseW;
+      std::optional<float> sentenceSilenceSeconds;
+      try {
+        noiseScale = requestFloatOption(input, {"noise_scale", "noiseScale"}, "noise_scale", 0.0f, 2.0f);
+        lengthScale = requestFloatOption(input, {"length_scale", "lengthScale"}, "length_scale", 0.05f, 10.0f);
+        noiseW = requestFloatOption(input, {"noise_w", "noiseW"}, "noise_w", 0.0f, 2.0f);
+        sentenceSilenceSeconds = requestFloatOption(input, {"sentence_silence", "sentenceSilence", "sentence_silence_seconds"},
+                                                    "sentence_silence", 0.0f, 30.0f);
+      } catch (const std::runtime_error &e) {
+        sendJson(clientSocket, 400,
+                 errorResponse("invalid_request", e.what()));
+        closeSocket(clientSocket);
+        return;
       }
 
       std::filesystem::create_directories(options.outputDir);
@@ -2526,28 +3175,78 @@ void handleClient(SocketHandle clientSocket, piper::PiperConfig &piperConfig,
       };
 
       try {
-        TtsJobRequest jobRequest;
-        jobRequest.text = safeText;
-        jobRequest.fileName = fileName;
-        jobRequest.outputPath = outputPath;
-        jobRequest.requestedModel = requestedModel;
-        jobRequest.speakerId = speakerId;
-        jobRequest.shouldCancel = shouldCancel;
+        if (looksLikeMarkupTts(text)) {
+          auto result = synthesizeMarkupScript(text, fileName, outputPath, requestedModel, speakerId,
+                                               noiseScale, lengthScale, noiseW, sentenceSilenceSeconds,
+                                               options, scheduler, shouldCancel);
+          metrics.sanitizedInputs++;
 
-        auto result = scheduler.synthesize(jobRequest);
+          sendJson(clientSocket, 201,
+                   successResponse("Audio generado exitosamente.",
+                                   json{{"file", fileName},
+                                        {"model", requestedModel.value_or(result.tts.modelName)},
+                                        {"url", "/api/v1/files/" + fileName},
+                                        {"format", "wav"},
+                                        {"chunks", result.tts.chunks},
+                                        {"bytes", result.tts.bytes},
+                                        {"audio_seconds", result.tts.synthesis.audioSeconds},
+                                        {"infer_seconds", result.tts.synthesis.inferSeconds},
+                                        {"real_time_factor", result.tts.synthesis.realTimeFactor},
+                                        {"markup", json{{"enabled", true},
+                                                         {"speech_segments", result.speechSegments},
+                                                         {"silence_segments", result.silenceSegments},
+                                                         {"sample_rate", result.outputSampleRate},
+                                                         {"segments", result.segments}}},
+                                        {"text_preprocessing", json{{"mode", "markup"}}}}));
+        } else {
+          TtsTextSanitizeResult sanitization;
+          const auto maxSafeTextChars = std::max<std::size_t>(1000, std::min<std::size_t>(50000, options.maxInputBytes));
+          const auto safeText = sanitizeTtsTextForApi(text, maxSafeTextChars, sanitization);
+          if (!sanitization.ok || safeText.empty()) {
+            metrics.rejectedTextInputs++;
+            sendJson(clientSocket, sanitization.warnings.empty() ? 400 : 422,
+                     errorResponse("text_not_pronounceable",
+                                   "El texto no contiene contenido pronunciable seguro después del filtrado."));
+            closeSocket(clientSocket);
+            return;
+          }
 
-        sendJson(clientSocket, 201,
-                 successResponse("Audio generado exitosamente.",
-                                 json{{"file", fileName},
-                                      {"model", result.modelName},
-                                      {"url", "/api/v1/files/" + fileName},
-                                      {"format", "wav"},
-                                      {"chunks", result.chunks},
-                                      {"bytes", result.bytes},
-                                      {"audio_seconds", result.synthesis.audioSeconds},
-                                      {"infer_seconds", result.synthesis.inferSeconds},
-                                      {"real_time_factor", result.synthesis.realTimeFactor},
-                                      {"text_preprocessing", ttsSanitizeResultToJson(sanitization)}}));
+          metrics.sanitizedInputs++;
+          metrics.sanitizeWarnings.fetch_add(static_cast<std::uint64_t>(sanitization.warnings.size()));
+          if (!sanitization.warnings.empty()) {
+            spdlog::info("{} TTS text sanitized: raw_bytes={} speak_bytes={} warnings={} risk={}",
+                         nowIso8601(), sanitization.rawBytes, sanitization.speakBytes,
+                         sanitization.warnings.size(), sanitization.riskScore);
+          }
+
+          TtsJobRequest jobRequest;
+          jobRequest.text = safeText;
+          jobRequest.fileName = fileName;
+          jobRequest.outputPath = outputPath;
+          jobRequest.requestedModel = requestedModel;
+          jobRequest.speakerId = speakerId;
+          jobRequest.noiseScale = noiseScale;
+          jobRequest.lengthScale = lengthScale;
+          jobRequest.noiseW = noiseW;
+          jobRequest.sentenceSilenceSeconds = sentenceSilenceSeconds;
+          jobRequest.shouldCancel = shouldCancel;
+
+          auto result = scheduler.synthesize(jobRequest);
+
+          sendJson(clientSocket, 201,
+                   successResponse("Audio generado exitosamente.",
+                                   json{{"file", fileName},
+                                        {"model", result.modelName},
+                                        {"url", "/api/v1/files/" + fileName},
+                                        {"format", "wav"},
+                                        {"chunks", result.chunks},
+                                        {"bytes", result.bytes},
+                                        {"audio_seconds", result.synthesis.audioSeconds},
+                                        {"infer_seconds", result.synthesis.inferSeconds},
+                                        {"real_time_factor", result.synthesis.realTimeFactor},
+                                        {"markup", json{{"enabled", false}}},
+                                        {"text_preprocessing", ttsSanitizeResultToJson(sanitization)}}));
+        }
       } catch (const std::runtime_error &e) {
         const std::string message = e.what();
         if (message == "synthesis_cancelled") {
