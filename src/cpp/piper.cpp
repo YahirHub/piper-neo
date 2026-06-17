@@ -15,6 +15,7 @@
 
 #include "json.hpp"
 #include "piper.hpp"
+#include "text_normalizer.hpp"
 #include "utf8.h"
 #include "wavfile.hpp"
 
@@ -581,6 +582,20 @@ void appendSilenceSamples(std::vector<int16_t> &audioBuffer, std::size_t samples
   audioBuffer.insert(audioBuffer.end(), samples, 0);
 }
 
+class ScopedTextNormalizationDisable {
+public:
+  explicit ScopedTextNormalizationDisable(TextNormalizationConfig &config)
+      : config(config), previousEnabled(config.enabled) {
+    config.enabled = false;
+  }
+
+  ~ScopedTextNormalizationDisable() { config.enabled = previousEnabled; }
+
+private:
+  TextNormalizationConfig &config;
+  bool previousEnabled;
+};
+
 std::string getVersion() { return VERSION; }
 
 // True if the string is a single UTF-8 codepoint
@@ -875,6 +890,7 @@ void loadVoice(PiperConfig &config, std::string modelPath,
   parsePhonemizeConfig(voice.configRoot, voice.phonemizeConfig);
   parseSynthesisConfig(voice.configRoot, voice.synthesisConfig);
   parseModelConfig(voice.configRoot, voice.modelConfig);
+  parseTextNormalizationConfig(voice.configRoot, voice.textNormalizationConfig);
 
   if (voice.modelConfig.numSpeakers > 1) {
     // Multi-speaker model
@@ -1008,6 +1024,15 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
                  const std::function<bool()> &shouldCancel) {
 
   throwIfSynthesisCancelled(shouldCancel);
+
+  if (voice.textNormalizationConfig.enabled) {
+    const auto normalizedText = normalizeTextForSpeech(text, voice.textNormalizationConfig);
+    if (normalizedText != text) {
+      spdlog::debug("Text normalized before phonemize: {}", previewTextForLog(normalizedText));
+      text = normalizedText;
+    }
+  }
+  ScopedTextNormalizationDisable textNormalizationGuard(voice.textNormalizationConfig);
 
   const float explicitSentenceSilenceSeconds =
       voice.synthesisConfig.sentenceSilenceSeconds;

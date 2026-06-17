@@ -49,3 +49,8 @@ models/*
 # Optional sample model removed from source ZIPs to keep the repository light
 etc/test_voice.onnx
 etc/test_voice.onnx.json
+
+# Neo Model Manager local artifacts
+apps/neo-model-manager/.venv/
+apps/neo-model-manager/exports/
+apps/neo-model-manager/*.neo

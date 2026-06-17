@@ -261,3 +261,7 @@ GET /api/v1/models/{model}/image
 ```
 
 El contexto técnico recuperable del proyecto está en `neo-docs/`.
+
+## Normalización de texto Piper Neo
+
+Piper Neo puede leer `neo.text_normalization` desde el `.onnx.json` o desde paquetes `.neo` para mejorar pronunciación antes de `phonemize`. Soporta reemplazos por modelo y reglas inteligentes para decimales, versiones, porcentajes, moneda, URLs y correos. Ver `docs/text-normalization.md`.

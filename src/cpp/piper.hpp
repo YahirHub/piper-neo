@@ -15,6 +15,7 @@
 #include <piper-phonemize/tashkeel.hpp>
 
 #include "json.hpp"
+#include "text_normalizer.hpp"
 
 using json = nlohmann::json;
 
@@ -96,6 +97,7 @@ struct Voice {
   PhonemizeConfig phonemizeConfig;
   SynthesisConfig synthesisConfig;
   ModelConfig modelConfig;
+  TextNormalizationConfig textNormalizationConfig;
   ModelSession session;
 };
 

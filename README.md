@@ -288,3 +288,7 @@ Default API flow:
 6. Use Live chat to connect any OpenAI-compatible `/v1` LLM provider, list or type a model manually, and narrate assistant responses with the selected Piper Neo voice.
 
 The Live chat screen persists the conversation while navigating across pages, sends the configured system prompt plus recent context to the LLM provider, supports new chat/regenerate, and adds a play button below each assistant message.
+
+## Normalización de texto Piper Neo
+
+Piper Neo puede leer `neo.text_normalization` desde el `.onnx.json` o desde paquetes `.neo` para mejorar pronunciación antes de `phonemize`. Soporta reemplazos por modelo y reglas inteligentes para decimales, versiones, porcentajes, moneda, URLs y correos. Ver `docs/text-normalization.md`.
