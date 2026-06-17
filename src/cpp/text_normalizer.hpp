@@ -18,16 +18,16 @@ struct TextReplacementRule {
 };
 
 struct TextNormalizationBuiltinConfig {
-  bool decimals = true;
-  bool versions = true;
-  bool percentages = true;
-  bool currency = true;
-  bool urls = true;
-  bool emails = true;
+  bool decimals = false;
+  bool versions = false;
+  bool percentages = false;
+  bool currency = false;
+  bool urls = false;
+  bool emails = false;
 };
 
 struct TextNormalizationConfig {
-  bool enabled = true;
+  bool enabled = false;
   std::string locale = "es-MX";
   TextNormalizationBuiltinConfig builtin;
   std::vector<TextReplacementRule> replacements;

@@ -255,6 +255,14 @@ std::string decimalToSpanish(const std::string &integerPart, const std::string &
   return out;
 }
 
+std::string decimalDigitsToSpeechText(const std::string &integerPart,
+                                      const std::string &fractionPart) {
+  if (fractionPart.empty()) {
+    return integerPart;
+  }
+  return integerPart + " punto " + fractionPart;
+}
+
 std::string versionToSpanish(const std::string &version) {
   bool hasVPrefix = !version.empty() && (version[0] == 'v' || version[0] == 'V');
   const auto raw = hasVPrefix ? version.substr(1) : version;
@@ -298,6 +306,8 @@ std::string urlToSpanish(const std::string &url) {
     value = value.substr(8);
   } else if (lower.rfind("http://", 0) == 0) {
     value = value.substr(7);
+  } else if (lower.rfind("www.", 0) == 0) {
+    value = value.substr(4);
   }
 
   std::string out = "enlace ";
@@ -325,6 +335,81 @@ std::string urlToSpanish(const std::string &url) {
   return out;
 }
 
+bool isTerminalPunctuation(char c) {
+  return c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == ')';
+}
+
+std::string stripTerminalPunctuation(std::string &token) {
+  std::string trailing;
+  while (!token.empty() && isTerminalPunctuation(token.back())) {
+    trailing.insert(trailing.begin(), token.back());
+    token.pop_back();
+  }
+  return trailing;
+}
+
+std::string currencyToSpanish(const std::string &currencyRaw,
+                              const std::string &suffixRaw,
+                              const std::string &integerPart,
+                              const std::string &fractionPart) {
+  const auto currency = lowerAsciiCopy(trimCopy(currencyRaw));
+  const auto suffix = lowerAsciiCopy(trimCopy(suffixRaw));
+  const bool isUsd = (currency == "usd") || (suffix == "usd") ||
+                     (suffix == "dolares") || (suffix == "dólares");
+
+  // No se convierten decimales monetarios a centavos. En contenido hablado
+  // para redes, noticias y tutoriales, `$99.50 pesos` debe conservarse como
+  // `99 punto 50 pesos`, sin inventar `con cincuenta centavos`.
+  std::string out = decimalDigitsToSpeechText(integerPart, fractionPart);
+  out += isUsd ? " dólares" : " pesos";
+  return out;
+}
+
+struct BuiltinNormalizationResult {
+  std::string text;
+  std::vector<std::string> protectedSegments;
+};
+
+std::string makeProtectedMarker(std::size_t index) {
+  return std::string("\x1F") + std::to_string(index) + "\x1F";
+}
+
+void appendProtectedSegment(BuiltinNormalizationResult &result,
+                            const std::string &speechText) {
+  const auto index = result.protectedSegments.size();
+  result.text += makeProtectedMarker(index);
+  result.protectedSegments.push_back(speechText);
+}
+
+std::string restoreProtectedSegments(const std::string &text,
+                                     const std::vector<std::string> &segments) {
+  std::string out;
+  out.reserve(text.size());
+
+  for (std::size_t i = 0; i < text.size();) {
+    if (text[i] == '\x1F') {
+      const auto end = text.find('\x1F', i + 1);
+      if (end != std::string::npos) {
+        const auto indexText = text.substr(i + 1, end - i - 1);
+        try {
+          const auto index = static_cast<std::size_t>(std::stoul(indexText));
+          if (index < segments.size()) {
+            out += segments[index];
+            i = end + 1;
+            continue;
+          }
+        } catch (...) {
+        }
+      }
+    }
+
+    out.push_back(text[i]);
+    ++i;
+  }
+
+  return out;
+}
+
 bool prefixRegexMatch(const std::string &text, std::size_t index,
                       const std::regex &regex, std::smatch &match) {
   const auto begin = text.cbegin() + static_cast<std::ptrdiff_t>(index);
@@ -340,37 +425,40 @@ bool isSafeRightBoundary(const std::string &text, std::size_t index) {
   return index >= text.size() || !isAsciiAlphaNumericOrUnderscore(text[index]);
 }
 
-std::string normalizeBuiltins(const std::string &text,
-                              const TextNormalizationBuiltinConfig &builtin) {
+BuiltinNormalizationResult normalizeBuiltins(const std::string &text,
+                                              const TextNormalizationBuiltinConfig &builtin) {
   static const std::regex urlRegex(R"(((?:https?://|www\.)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+))",
                                   std::regex::ECMAScript | std::regex::icase);
   static const std::regex emailRegex(R"(([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}))",
                                     std::regex::ECMAScript);
   static const std::regex versionRegex(R"((v?\d+(?:\.\d+){2,}))",
                                       std::regex::ECMAScript | std::regex::icase);
-  static const std::regex currencyPrefixRegex(R"((\$|MXN\s+|USD\s+)(\d+)(?:\.(\d+))?)",
+  static const std::regex currencyPrefixRegex(R"((\$|MXN\s+|USD\s+)(\d+)(?:\.(\d+))?(?:\s*(pesos?|mxn|USD|dolares|dólares))?)",
                                              std::regex::ECMAScript | std::regex::icase);
   static const std::regex percentRegex(R"((\d+)\.(\d+)%|(\d+)%)",
                                       std::regex::ECMAScript);
   static const std::regex decimalRegex(R"((\d+)\.(\d+))",
                                       std::regex::ECMAScript);
 
-  std::string out;
-  out.reserve(text.size());
+  BuiltinNormalizationResult result;
+  result.text.reserve(text.size());
 
   for (std::size_t i = 0; i < text.size();) {
     std::smatch match;
 
     if (builtin.urls && prefixRegexMatch(text, i, urlRegex, match)) {
-      const auto token = match.str(1);
-      out += urlToSpanish(token);
-      i += token.size();
+      const auto rawToken = match.str(1);
+      auto token = rawToken;
+      const auto trailing = stripTerminalPunctuation(token);
+      appendProtectedSegment(result, urlToSpanish(token));
+      result.text += trailing;
+      i += rawToken.size();
       continue;
     }
 
     if (builtin.emails && prefixRegexMatch(text, i, emailRegex, match) && isSafeLeftBoundary(text, i)) {
       const auto token = match.str(1);
-      out += emailToSpanish(token);
+      appendProtectedSegment(result, emailToSpanish(token));
       i += token.size();
       continue;
     }
@@ -378,31 +466,14 @@ std::string normalizeBuiltins(const std::string &text,
     if (builtin.versions && prefixRegexMatch(text, i, versionRegex, match) &&
         isSafeLeftBoundary(text, i) && isSafeRightBoundary(text, i + match.str(1).size())) {
       const auto token = match.str(1);
-      out += versionToSpanish(token);
+      appendProtectedSegment(result, versionToSpanish(token));
       i += token.size();
       continue;
     }
 
     if (builtin.currency && prefixRegexMatch(text, i, currencyPrefixRegex, match) && isSafeLeftBoundary(text, i)) {
       const auto token = match.str(0);
-      const auto currency = lowerAsciiCopy(trimCopy(match.str(1)));
-      const auto integerPart = match.str(2);
-      const auto fractionPart = match.str(3);
-      out += numericGroupToSpanish(integerPart);
-      if (currency == "usd") {
-        out += " dólares";
-      } else {
-        out += " pesos";
-      }
-      if (!fractionPart.empty()) {
-        out += " con ";
-        if (fractionPart.size() > 1 && fractionPart[0] == '0') {
-          out += digitsToSpanish(fractionPart);
-        } else {
-          out += numericGroupToSpanish(fractionPart);
-        }
-        out += " centavos";
-      }
+      appendProtectedSegment(result, currencyToSpanish(match.str(1), match.str(4), match.str(2), match.str(3)));
       i += token.size();
       continue;
     }
@@ -410,9 +481,9 @@ std::string normalizeBuiltins(const std::string &text,
     if (builtin.percentages && prefixRegexMatch(text, i, percentRegex, match) && isSafeLeftBoundary(text, i)) {
       const auto token = match.str(0);
       if (!match.str(1).empty()) {
-        out += decimalToSpanish(match.str(1), match.str(2)) + " por ciento";
+        appendProtectedSegment(result, decimalDigitsToSpeechText(match.str(1), match.str(2)) + " por ciento");
       } else {
-        out += numericGroupToSpanish(match.str(3)) + " por ciento";
+        appendProtectedSegment(result, match.str(3) + " por ciento");
       }
       i += token.size();
       continue;
@@ -421,16 +492,16 @@ std::string normalizeBuiltins(const std::string &text,
     if (builtin.decimals && prefixRegexMatch(text, i, decimalRegex, match) &&
         isSafeLeftBoundary(text, i) && isSafeRightBoundary(text, i + match.str(0).size())) {
       const auto token = match.str(0);
-      out += decimalToSpanish(match.str(1), match.str(2));
+      appendProtectedSegment(result, decimalToSpanish(match.str(1), match.str(2)));
       i += token.size();
       continue;
     }
 
-    out.push_back(text[i]);
+    result.text.push_back(text[i]);
     ++i;
   }
 
-  return out;
+  return result;
 }
 
 void parseBuiltinFlags(const nlohmann::json &root, TextNormalizationBuiltinConfig &builtin) {
@@ -478,20 +549,35 @@ std::vector<TextReplacementRule> parseReplacementArray(const nlohmann::json &ite
 
 void parseTextNormalizationConfig(const nlohmann::json &configRoot,
                                   TextNormalizationConfig &config) {
-  // Defaults stay enabled so Piper Neo improves common Spanish TTS cases even
-  // when a classic Piper JSON has no neo.text_normalization block.
+  // A classic Piper JSON must not be modified implicitly. Normalization is
+  // enabled only when the model explicitly declares neo.text_normalization, or
+  // when it carries legacy modelcard.replacements from older managers.
   config = TextNormalizationConfig{};
 
   try {
+    bool hasNeoTextNormalization = false;
+
     if (configRoot.contains("neo") && configRoot["neo"].is_object()) {
       const auto &neo = configRoot["neo"];
       if (neo.contains("text_normalization") && neo["text_normalization"].is_object()) {
+        hasNeoTextNormalization = true;
         const auto &tn = neo["text_normalization"];
-        config.enabled = tn.value("enabled", config.enabled);
+
+        config.enabled = tn.value("enabled", true);
         config.locale = tn.value("locale", config.locale);
+
+        // In the explicit Piper Neo schema, builtins default to enabled unless
+        // the JSON turns individual flags off.
+        config.builtin.decimals = true;
+        config.builtin.versions = true;
+        config.builtin.percentages = true;
+        config.builtin.currency = true;
+        config.builtin.urls = true;
+        config.builtin.emails = true;
         if (tn.contains("builtin")) {
           parseBuiltinFlags(tn["builtin"], config.builtin);
         }
+
         if (tn.contains("replacements")) {
           auto parsed = parseReplacementArray(tn["replacements"]);
           config.replacements.insert(config.replacements.end(), parsed.begin(), parsed.end());
@@ -500,11 +586,15 @@ void parseTextNormalizationConfig(const nlohmann::json &configRoot,
     }
 
     // Legacy managers used modelcard.replacements as [[from, to], ...]. Keep it
-    // supported so older JSON files immediately benefit from the new core.
+    // supported, but do not enable smart builtins unless neo.text_normalization
+    // exists. This prevents old Piper JSON files from changing unexpectedly.
     if (configRoot.contains("modelcard") && configRoot["modelcard"].is_object()) {
       const auto &card = configRoot["modelcard"];
       if (card.contains("replacements")) {
         auto parsed = parseReplacementArray(card["replacements"]);
+        if (!parsed.empty() && !hasNeoTextNormalization) {
+          config.enabled = true;
+        }
         config.replacements.insert(config.replacements.end(), parsed.begin(), parsed.end());
       }
     }
@@ -520,9 +610,9 @@ std::string normalizeTextForSpeech(const std::string &text,
     return text;
   }
 
-  std::string normalized = normalizeBuiltins(text, config.builtin);
-  normalized = applyCustomReplacements(normalized, config.replacements);
-  return normalized;
+  auto builtinResult = normalizeBuiltins(text, config.builtin);
+  auto normalized = applyCustomReplacements(builtinResult.text, config.replacements);
+  return restoreProtectedSegments(normalized, builtinResult.protectedSegments);
 }
 
 } // namespace piper

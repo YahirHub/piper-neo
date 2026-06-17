@@ -81,7 +81,7 @@ La metadata visible del modelo se guarda en:
 }
 ```
 
-La normalización de texto se guarda en:
+La normalización de texto se guarda en el JSON fuente. Al abrir el editor, los cambios se hacen sobre una copia temporal; se escriben en disco solo al presionar Guardar:
 
 ```json
 {
@@ -128,3 +128,11 @@ La imagen base64 se elimina de `metadata.json` durante la exportación y se muev
 
 - Piper clásico puede ignorar los campos `modelcard` y `neo`.
 - Piper Neo puede usar esos campos para mostrar metadata, avatar, futuras reglas de normalización y exportación `.neo`.
+
+## Cancelar no guarda cambios
+
+El editor de modelos usa una copia temporal del JSON. Si cambias imagen, metadata o reemplazos y presionas Cancelar, esos cambios no se escriben en el `.onnx.json`. Solo Guardar actualiza el modelo fuente.
+
+## Activación explícita en el core
+
+El core de Piper Neo no altera un JSON clásico automáticamente. La capa se activa cuando existe `neo.text_normalization` o cuando el modelo trae reemplazos legacy en `modelcard.replacements`. Esto evita cambiar el comportamiento de modelos normales que no fueron preparados para Piper Neo.

@@ -72,3 +72,12 @@ La app queda organizada en módulos:
 - Agregar reglas de reemplazo y verificar que queden en `neo.text_normalization`.
 - Exportar un `.neo` y probar que Piper Neo lo cargue correctamente.
 - Implementar después la lectura de reemplazos en el core TTS para que la configuración tenga efecto durante la síntesis.
+
+
+## Revisión adicional antes de commit
+
+- El editor de modelos ahora trabaja con una copia temporal del JSON.
+- Cancelar descarta cambios de imagen, metadata y reemplazos.
+- Guardar copia los cambios al registro real y luego actualiza el `.onnx.json`.
+- La edición de reemplazos valida duplicados también al modificar una regla existente.
+- La sección de reglas inteligentes se renombró como reglas incluidas, no futuras.

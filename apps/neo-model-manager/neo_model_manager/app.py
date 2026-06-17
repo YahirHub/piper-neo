@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 from typing import Any
@@ -327,7 +328,16 @@ class ReplacementEditDialog(QDialog):
 class ModelEditDialog(QDialog):
     def __init__(self, record: ModelRecord, parent: QWidget | None = None):
         super().__init__(parent)
-        self.record = record
+        self.source_record = record
+        # Work on a detached copy so Cancel really discards image, metadata and
+        # replacement edits made inside the dialog. The main window copies this
+        # data back only after Save is accepted.
+        self.record = ModelRecord(
+            record.source_id,
+            record.onnx_path,
+            record.config_path,
+            copy.deepcopy(record.data),
+        )
         self.setWindowTitle(f"Editar modelo · {record.source_id}")
         self.setMinimumSize(980, 720)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
@@ -444,7 +454,7 @@ class ModelEditDialog(QDialog):
         top.addWidget(help_btn)
         layout.addLayout(top)
 
-        builtins_group = QGroupBox("Reglas inteligentes futuras")
+        builtins_group = QGroupBox("Reglas inteligentes incluidas")
         builtins = QGridLayout(builtins_group)
         self.builtin_checks: dict[str, QCheckBox] = {}
         labels = {
@@ -499,9 +509,9 @@ class ModelEditDialog(QDialog):
         return browser
 
     def _load_record(self) -> None:
-        card = self.record.modelcard
         ensure_modelcard_defaults(self.record.data, self.record.source_id, self.record.onnx_path)
         normalization = ensure_text_normalization_defaults(self.record.data)
+        card = self.record.modelcard
 
         self.id_edit.setText(str(card.get("id", self.record.source_id)))
         self.name_edit.setText(str(card.get("name", self.record.source_id)))
@@ -623,7 +633,15 @@ class ModelEditDialog(QDialog):
         rules = self._current_replacements()
         dialog = ReplacementEditDialog(rules[index], self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            rules[index] = dialog.get_rule()
+            rule = dialog.get_rule()
+            duplicate = any(
+                i != index and str(item.get("from", "")).lower() == rule["from"].lower()
+                for i, item in enumerate(rules)
+            )
+            if duplicate:
+                QMessageBox.warning(self, "Duplicado", "Ya existe otra regla con ese texto de búsqueda.")
+                return
+            rules[index] = rule
             self._refresh_replacements_table()
 
     def _delete_replacement(self) -> None:
@@ -686,16 +704,16 @@ class ModelEditDialog(QDialog):
         return new_id
 
     def _validate_and_accept(self) -> None:
-        try:
-            new_id = self._apply_form_to_record()
-        except Exception as exc:
-            QMessageBox.critical(self, "Validación", str(exc))
-            return
-        if not new_id:
+        if not self.id_edit.text().strip():
             QMessageBox.warning(self, "Validación", "El ID del modelo no puede quedar vacío.")
             return
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "Validación", "El nombre visible no puede quedar vacío.")
+            return
+        try:
+            self._apply_form_to_record()
+        except Exception as exc:
+            QMessageBox.critical(self, "Validación", str(exc))
             return
         self.accept()
 
@@ -910,6 +928,7 @@ class MainWindow(QMainWindow):
         dialog = ModelEditDialog(record, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        record.data = copy.deepcopy(dialog.record.data)
         new_id = record.modelcard.get("id", record.source_id)
         try:
             updated = save_record(record, str(new_id))

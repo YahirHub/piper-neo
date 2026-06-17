@@ -582,20 +582,6 @@ void appendSilenceSamples(std::vector<int16_t> &audioBuffer, std::size_t samples
   audioBuffer.insert(audioBuffer.end(), samples, 0);
 }
 
-class ScopedTextNormalizationDisable {
-public:
-  explicit ScopedTextNormalizationDisable(TextNormalizationConfig &config)
-      : config(config), previousEnabled(config.enabled) {
-    config.enabled = false;
-  }
-
-  ~ScopedTextNormalizationDisable() { config.enabled = previousEnabled; }
-
-private:
-  TextNormalizationConfig &config;
-  bool previousEnabled;
-};
-
 std::string getVersion() { return VERSION; }
 
 // True if the string is a single UTF-8 codepoint
@@ -1018,22 +1004,22 @@ void synthesize(std::vector<PhonemeId> &phonemeIds,
 // ----------------------------------------------------------------------------
 
 // Phonemize text and synthesize audio
-void textToAudio(PiperConfig &config, Voice &voice, std::string text,
-                 std::vector<int16_t> &audioBuffer, SynthesisResult &result,
-                 const std::function<void()> &audioCallback,
-                 const std::function<bool()> &shouldCancel) {
+void textToAudioInternal(PiperConfig &config, Voice &voice, std::string text,
+                         std::vector<int16_t> &audioBuffer,
+                         SynthesisResult &result,
+                         const std::function<void()> &audioCallback,
+                         const std::function<bool()> &shouldCancel,
+                         bool allowTextNormalization) {
 
   throwIfSynthesisCancelled(shouldCancel);
 
-  if (voice.textNormalizationConfig.enabled) {
+  if (allowTextNormalization && voice.textNormalizationConfig.enabled) {
     const auto normalizedText = normalizeTextForSpeech(text, voice.textNormalizationConfig);
     if (normalizedText != text) {
       spdlog::debug("Text normalized before phonemize: {}", previewTextForLog(normalizedText));
       text = normalizedText;
     }
   }
-  ScopedTextNormalizationDisable textNormalizationGuard(voice.textNormalizationConfig);
-
   const float explicitSentenceSilenceSeconds =
       voice.synthesisConfig.sentenceSilenceSeconds;
   if (explicitSentenceSilenceSeconds > 0) {
@@ -1052,8 +1038,8 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
           throwIfSynthesisCancelled(shouldCancel);
 
           SynthesisResult chunkResult;
-          textToAudio(config, voice, chunk.text, audioBuffer, chunkResult,
-                      audioCallback, shouldCancel);
+          textToAudioInternal(config, voice, chunk.text, audioBuffer, chunkResult,
+                              audioCallback, shouldCancel, false);
           result.audioSeconds += chunkResult.audioSeconds;
           result.inferSeconds += chunkResult.inferSeconds;
 
@@ -1253,7 +1239,15 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
     result.realTimeFactor = result.inferSeconds / result.audioSeconds;
   }
 
-} /* textToAudio */
+} /* textToAudioInternal */
+
+void textToAudio(PiperConfig &config, Voice &voice, std::string text,
+                 std::vector<int16_t> &audioBuffer, SynthesisResult &result,
+                 const std::function<void()> &audioCallback,
+                 const std::function<bool()> &shouldCancel) {
+  textToAudioInternal(config, voice, text, audioBuffer, result, audioCallback,
+                      shouldCancel, true);
+}
 
 void writeStreamingWav(PiperConfig &config, Voice &voice,
                        const std::vector<std::string> &textChunks,

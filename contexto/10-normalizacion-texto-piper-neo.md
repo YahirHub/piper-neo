@@ -56,7 +56,7 @@ No se agregaron librerías externas. Se usan utilidades estándar de C++17: `reg
 - Probar con modelos reales de distintos países para ajustar naturalidad de números largos.
 - Evaluar reglas específicas por locale en el futuro, por ejemplo `es-MX`, `es-AR` o `en-US`.
 - Agregar pruebas unitarias dedicadas cuando el proyecto tenga una suite estable para core.
-- Evaluar normalización más avanzada para moneda según contexto: MXN, USD, EUR.
+- Evaluar normalización más avanzada para moneda según contexto: MXN, USD, EUR, sin convertir decimales a centavos salvo que el usuario lo pida explícitamente.
 - Permitir que el Model Manager genere presets por idioma.
 
 # Próximos pasos
@@ -64,3 +64,11 @@ No se agregaron librerías externas. Se usan utilidades estándar de C++17: `reg
 - Probar textos con `3.5`, `10.25`, `10.25%`, `$10.25`, `v1.0.3`, correos y URLs.
 - Exportar un modelo `.neo` desde `apps/neo-model-manager` con reglas personalizadas.
 - Confirmar que Piper Neo use esas reglas tanto desde `.onnx + .json` como desde `.neo`.
+
+
+## Revisión adicional antes de commit
+
+- La normalización dejó de activarse por defecto en JSON clásicos sin `neo.text_normalization`.
+- Si solo existen `modelcard.replacements` legacy, se aplican reemplazos sin activar reglas inteligentes.
+- Se eliminó la mutación temporal de `voice.textNormalizationConfig.enabled` durante síntesis para evitar interferencias entre solicitudes concurrentes.
+- La recursión interna de pausas recibe `allowTextNormalization=false` en lugar de modificar el estado compartido de la voz.
