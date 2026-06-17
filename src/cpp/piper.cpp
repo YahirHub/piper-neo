@@ -393,6 +393,194 @@ std::vector<std::string> splitTextIntoChunks(const std::string &text,
   return chunks;
 }
 
+
+struct ExplicitSentenceChunk {
+  std::string text;
+  bool addSilenceAfter = false;
+};
+
+bool isAsciiDigitAt(const std::string &text, std::size_t index) {
+  return (index < text.size()) && (text[index] >= '0') && (text[index] <= '9');
+}
+
+bool isAsciiLetterAt(const std::string &text, std::size_t index) {
+  if (index >= text.size()) {
+    return false;
+  }
+  const unsigned char value = static_cast<unsigned char>(text[index]);
+  return ((value >= 'A') && (value <= 'Z')) || ((value >= 'a') && (value <= 'z'));
+}
+
+std::string lowerAsciiCopy(std::string value) {
+  for (auto &ch : value) {
+    if ((ch >= 'A') && (ch <= 'Z')) {
+      ch = static_cast<char>(ch - 'A' + 'a');
+    }
+  }
+  return value;
+}
+
+std::string previousAsciiToken(const std::string &text, std::size_t periodIndex) {
+  if (periodIndex == 0) {
+    return {};
+  }
+
+  std::size_t end = periodIndex;
+  while ((end > 0) && isAsciiWhitespace(text[end - 1])) {
+    --end;
+  }
+
+  std::size_t begin = end;
+  while ((begin > 0) && isAsciiLetterAt(text, begin - 1)) {
+    --begin;
+  }
+
+  return text.substr(begin, end - begin);
+}
+
+bool isLikelyAbbreviationPeriod(const std::string &text, std::size_t periodIndex) {
+  const auto token = lowerAsciiCopy(previousAsciiToken(text, periodIndex));
+  if (token.empty()) {
+    return false;
+  }
+
+  static const std::vector<std::string> abbreviations = {
+      "sr", "sra", "srta", "dr", "dra", "lic", "ing", "arq", "mtro",
+      "mtra", "prof", "profa", "etc", "ej", "p", "pag", "tel", "av",
+      "col", "num", "no", "vs", "ud", "uds"};
+
+  return std::find(abbreviations.begin(), abbreviations.end(), token) != abbreviations.end();
+}
+
+bool isSentencePeriodBoundary(const std::string &text, std::size_t index) {
+  if (text[index] != '.') {
+    return false;
+  }
+
+  // Decimal numbers and version-like values should not create a sentence pause.
+  if ((index > 0) && isAsciiDigitAt(text, index - 1) && isAsciiDigitAt(text, index + 1)) {
+    return false;
+  }
+
+  if (isLikelyAbbreviationPeriod(text, index)) {
+    return false;
+  }
+
+  const std::size_t splitAt = skipClosingMarksForward(text, index + 1, text.size());
+  return (splitAt >= text.size()) || isAsciiWhitespace(text[splitAt]);
+}
+
+bool isLineBreakBoundary(const std::string &text, std::size_t index,
+                         std::size_t &splitAt) {
+  const char value = text[index];
+  if ((value != '\n') && (value != '\r')) {
+    return false;
+  }
+
+  splitAt = index + 1;
+  if ((value == '\r') && (splitAt < text.size()) && (text[splitAt] == '\n')) {
+    ++splitAt;
+  }
+
+  // Consecutive line breaks represent the same intentional pause. Collapse them
+  // into one boundary so empty lines do not synthesize empty segments.
+  while (splitAt < text.size()) {
+    if (text[splitAt] == '\n') {
+      ++splitAt;
+      continue;
+    }
+
+    if (text[splitAt] == '\r') {
+      ++splitAt;
+      if ((splitAt < text.size()) && (text[splitAt] == '\n')) {
+        ++splitAt;
+      }
+      continue;
+    }
+
+    break;
+  }
+
+  return true;
+}
+
+bool isExplicitSentenceBoundary(const std::string &text, std::size_t index,
+                                std::size_t &splitAt) {
+  if (index >= text.size()) {
+    return false;
+  }
+
+  const char value = text[index];
+  if (value == '.') {
+    if (!isSentencePeriodBoundary(text, index)) {
+      return false;
+    }
+    splitAt = skipClosingMarksForward(text, index + 1, text.size());
+    return true;
+  }
+
+  if ((value == '!') || (value == '?')) {
+    splitAt = skipClosingMarksForward(text, index + 1, text.size());
+    return hasBoundaryAfter(text, index + 1);
+  }
+
+  if (isUtf8Ellipsis(text, index)) {
+    splitAt = skipClosingMarksForward(text, index + 3, text.size());
+    return hasBoundaryAfter(text, index + 3);
+  }
+
+  return isLineBreakBoundary(text, index, splitAt);
+}
+
+std::vector<ExplicitSentenceChunk> splitTextIntoExplicitSentenceChunks(const std::string &text) {
+  std::vector<ExplicitSentenceChunk> chunks;
+  std::size_t offset = 0;
+
+  while (offset < text.size()) {
+    std::size_t splitAt = std::string::npos;
+    for (std::size_t i = offset; i < text.size(); ++i) {
+      if (isUtf8ContinuationByte(text[i])) {
+        continue;
+      }
+
+      if (isExplicitSentenceBoundary(text, i, splitAt)) {
+        break;
+      }
+    }
+
+    if (splitAt == std::string::npos) {
+      auto tail = text.substr(offset);
+      if (!tail.empty()) {
+        chunks.push_back({tail, false});
+      }
+      break;
+    }
+
+    auto sentence = text.substr(offset, splitAt - offset);
+    if (!sentence.empty()) {
+      chunks.push_back({sentence, true});
+    }
+
+    offset = splitAt;
+    while ((offset < text.size()) && isAsciiWhitespace(text[offset])) {
+      ++offset;
+    }
+  }
+
+  if (!chunks.empty()) {
+    chunks.back().addSilenceAfter = false;
+  }
+
+  return chunks;
+}
+
+void appendSilenceSamples(std::vector<int16_t> &audioBuffer, std::size_t samples) {
+  if (samples == 0) {
+    return;
+  }
+  audioBuffer.insert(audioBuffer.end(), samples, 0);
+}
+
 std::string getVersion() { return VERSION; }
 
 // True if the string is a single UTF-8 codepoint
@@ -821,6 +1009,51 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
 
   throwIfSynthesisCancelled(shouldCancel);
 
+  const float explicitSentenceSilenceSeconds =
+      voice.synthesisConfig.sentenceSilenceSeconds;
+  if (explicitSentenceSilenceSeconds > 0) {
+    auto explicitChunks = splitTextIntoExplicitSentenceChunks(text);
+    if (explicitChunks.size() > 1) {
+      const auto previousSentenceSilence =
+          voice.synthesisConfig.sentenceSilenceSeconds;
+      voice.synthesisConfig.sentenceSilenceSeconds = 0.0f;
+
+      const auto explicitSilenceSamples = static_cast<std::size_t>(
+          explicitSentenceSilenceSeconds * voice.synthesisConfig.sampleRate *
+          voice.synthesisConfig.channels);
+
+      try {
+        for (const auto &chunk : explicitChunks) {
+          throwIfSynthesisCancelled(shouldCancel);
+
+          SynthesisResult chunkResult;
+          textToAudio(config, voice, chunk.text, audioBuffer, chunkResult,
+                      audioCallback, shouldCancel);
+          result.audioSeconds += chunkResult.audioSeconds;
+          result.inferSeconds += chunkResult.inferSeconds;
+
+          if (chunk.addSilenceAfter && (explicitSilenceSamples > 0)) {
+            appendSilenceSamples(audioBuffer, explicitSilenceSamples);
+            result.audioSeconds += explicitSentenceSilenceSeconds;
+            if (audioCallback) {
+              audioCallback();
+              audioBuffer.clear();
+            }
+          }
+        }
+
+        voice.synthesisConfig.sentenceSilenceSeconds = previousSentenceSilence;
+        if (result.audioSeconds > 0) {
+          result.realTimeFactor = result.inferSeconds / result.audioSeconds;
+        }
+        return;
+      } catch (...) {
+        voice.synthesisConfig.sentenceSilenceSeconds = previousSentenceSilence;
+        throw;
+      }
+    }
+  }
+
   std::size_t sentenceSilenceSamples = 0;
   if (voice.synthesisConfig.sentenceSilenceSeconds > 0) {
     sentenceSilenceSamples = (std::size_t)(
@@ -965,6 +1198,7 @@ void textToAudio(PiperConfig &config, Voice &voice, std::string text,
       for (std::size_t i = 0; i < sentenceSilenceSamples; i++) {
         audioBuffer.push_back(0);
       }
+      result.audioSeconds += voice.synthesisConfig.sentenceSilenceSeconds;
     }
 
     throwIfSynthesisCancelled(shouldCancel);

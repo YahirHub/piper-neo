@@ -64,8 +64,8 @@ struct SynthesisConfig {
   // Speaker id from 0 to numSpeakers - 1
   std::optional<SpeakerId> speakerId;
 
-  // Extra silence
-  float sentenceSilenceSeconds = 0.2f;
+  // Extra silence after explicit sentence endings and line breaks
+  float sentenceSilenceSeconds = 0.35f;
   std::optional<std::map<piper::Phoneme, float>> phonemeSilenceSeconds;
 };
 
