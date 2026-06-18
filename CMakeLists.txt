@@ -20,9 +20,13 @@ if(MSVC)
   # Force compiler to use UTF-8 for IPA constants
   add_compile_options("$<$<C_COMPILER_ID:MSVC>:/utf-8>")
   add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
-elseif(NOT APPLE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Linux flags
   string(APPEND CMAKE_CXX_FLAGS " -Wall -Wextra -Wl,-rpath,'$ORIGIN'")
+  string(APPEND CMAKE_C_FLAGS " -Wall -Wextra")
+elseif(MINGW)
+  # Native Windows build with MinGW/WinLibs. Do not add Linux rpath flags here.
+  string(APPEND CMAKE_CXX_FLAGS " -Wall -Wextra")
   string(APPEND CMAKE_C_FLAGS " -Wall -Wextra")
 endif()
 
@@ -81,7 +85,10 @@ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
     piper_phonemize_external
     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/p"
     URL "https://github.com/rhasspy/piper-phonemize/archive/refs/heads/master.zip"
-    CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR}
+    CMAKE_ARGS
+      -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR}
+      -DBUILD_TESTING:BOOL=OFF
+      -DPIPER_BUILD_TESTS:BOOL=OFF
   )
   add_dependencies(piper piper_phonemize_external)
   if(PIPER_BUILD_TESTS)
@@ -91,13 +98,16 @@ endif()
 
 # ---- Declare executable ----
 
-if((NOT MSVC) AND (NOT APPLE))
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Linux flags
   string(APPEND CMAKE_CXX_FLAGS " -Wall -Wextra -Wl,-rpath,'$ORIGIN'")
   string(APPEND CMAKE_C_FLAGS " -Wall -Wextra")
   target_link_libraries(piper -static-libgcc -static-libstdc++)
 
   set(PIPER_EXTRA_LIBRARIES "pthread")
+elseif(MINGW)
+  # Keep MinGW/WinLibs builds native to Windows and avoid Linux-only rpath/pthread.
+  target_link_options(piper PRIVATE -static-libgcc -static-libstdc++)
 endif()
 
 target_link_libraries(piper

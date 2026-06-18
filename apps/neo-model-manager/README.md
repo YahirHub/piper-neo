@@ -90,12 +90,12 @@ La normalización de texto se guarda en el JSON fuente. Al abrir el editor, los 
       "enabled": true,
       "locale": "es-MX",
       "builtin": {
-        "decimals": true,
-        "versions": true,
-        "percentages": true,
-        "currency": true,
-        "urls": true,
-        "emails": true
+        "decimals": false,
+        "versions": false,
+        "percentages": false,
+        "currency": false,
+        "urls": false,
+        "emails": false
       },
       "replacements": [
         {

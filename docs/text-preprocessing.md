@@ -16,7 +16,7 @@ Piper Neo ahora protege el texto antes de enviarlo al fonemizador y al modelo de
    - Elimina controles, caracteres invisibles, BOM, variation selectors y marcas de dirección.
    - Normaliza puntuación común, full-width ASCII y ligaduras frecuentes.
    - Convierte HTML/BBCode/Markdown a texto plano.
-   - Resume URLs, correos, código, hashes/base64 y emoji.
+   - Ya no resume URLs ni correos; solo protege/limpia ruido técnico, hashes/base64, código y emoji. La lectura de URLs/correos queda en la configuración del modelo.
    - Colapsa repeticiones y espacios.
    - Rechaza con `422 text_not_pronounceable` si el texto queda vacío o no es seguro.
 
@@ -28,7 +28,7 @@ Piper Neo ahora protege el texto antes de enviarlo al fonemizador y al modelo de
 {
   "text_preprocessing": {
     "speakText": "Texto final enviado al motor de voz",
-    "warnings": ["URL_SUMMARIZED", "MARKUP_STRIPPED"],
+    "warnings": ["MARKUP_STRIPPED"],
     "riskScore": 0.28,
     "stats": {
       "rawChars": 120,
@@ -49,7 +49,7 @@ Piper Neo ahora protege el texto antes de enviarlo al fonemizador y al modelo de
 En **Ajustes → Filtro de texto para voz**:
 
 - **Sanitizar texto antes de la API**: deja activo el filtro del cliente. Aunque se desactive, el servidor sigue protegiendo la API.
-- **Modo normal**: recomendado. Resume enlaces, código y ruido técnico.
+- **Modo normal**: recomendado. Limpia código y ruido técnico; no convierte enlaces ni correos en frases fijas.
 - **Modo literal**: conserva más contenido, pero sigue reparando Unicode y texto peligroso.
 - **Límite seguro de caracteres**: valor inicial 5000.
 

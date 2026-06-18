@@ -112,22 +112,22 @@ modelo.onnx.json</pre>
     "text_normalization": {
       "enabled": true,
       "locale": "es-MX",
-      "builtin": { "decimals": true, "versions": true },
+      "builtin": { "decimals": false, "versions": false, "urls": false },
       "replacements": []
     }
   }
 }</pre>
-<p><b>Activar normalización:</b> permite que Piper Neo aplique reglas de reemplazo y futuras reglas inteligentes. Si está desactivada, el modelo conserva su texto casi sin tocar.</p>
+<p><b>Activar normalización:</b> permite que Piper Neo aplique reglas de reemplazo y reglas inteligentes explícitamente marcadas. Si está desactivada, el modelo conserva su texto casi sin tocar.</p>
 <p><b>Locale:</b> indica variante regional. Ejemplo: <code>es-MX</code>, <code>es-AR</code>. Sirve para decidir cómo leer moneda, números o expresiones locales.</p>
 
 <h2>7. Reglas inteligentes futuras</h2>
-<p>Estas casillas no son reemplazos manuales. Son banderas para que el core de Piper Neo pueda aplicar reglas seguras por tipo de texto.</p>
+<p>Estas casillas no son reemplazos manuales. Son banderas por modelo; Piper Neo no debe convertir URLs, correos, moneda ni porcentajes si el modelo no lo pidió explícitamente.</p>
 <ul>
   <li><b>Decimales:</b> <code>3.5</code> debería leerse como <code>tres punto cinco</code>, no como <code>tres cinco</code>.</li>
   <li><b>Versiones:</b> <code>1.0.3</code> debe conservar sus puntos como versión, no como cortes de oración.</li>
   <li><b>Porcentajes:</b> <code>10.25%</code> debe leerse como porcentaje, no como número aislado.</li>
   <li><b>Moneda:</b> <code>$10.25</code> puede leerse como dinero según el locale.</li>
-  <li><b>URLs:</b> evita romper dominios como <code>openai.com</code> o <code>thowilabs.com</code>.</li>
+  <li><b>URLs:</b> solo procesa enlaces con <code>http://</code>, <code>https://</code> o <code>www.</code>; no añade un prefijo fijo como “enlace a”.</li>
   <li><b>Correos:</b> evita reemplazos peligrosos dentro de direcciones como <code>demo@dominio.com</code>.</li>
 </ul>
 
@@ -137,7 +137,7 @@ modelo.onnx.json</pre>
 Amazon Prime → Amazon Praim
 Prime → Praim
 YouTube → Yutub</pre>
-<p>Úsalos cuando una palabra se pronuncia mal de forma constante. No conviene usarlos para todo; números, URLs y moneda deben tratarse con reglas inteligentes o por criterio del modelo.</p>
+<p>Úsalos cuando una palabra se pronuncia mal de forma constante. No conviene usarlos para todo; números, URLs y moneda deben tratarse con reglas inteligentes solo cuando ese modelo lo necesite.</p>
 
 <h2>9. Buscar y reemplazar</h2>
 <ul>
@@ -462,7 +462,7 @@ class ModelEditDialog(QDialog):
             "versions": "Versiones: 1.0.3 → versión uno punto cero punto tres",
             "percentages": "Porcentajes: 10.25%",
             "currency": "Moneda: $10.25",
-            "urls": "URLs y dominios",
+            "urls": "URLs con protocolo/www",
             "emails": "Correos electrónicos",
         }
         for i, (key, label) in enumerate(labels.items()):
@@ -546,7 +546,7 @@ class ModelEditDialog(QDialog):
         self.locale_edit.setText(str(normalization.get("locale", "es-MX")))
         builtin = normalization.get("builtin", {}) if isinstance(normalization.get("builtin"), dict) else {}
         for key, check in self.builtin_checks.items():
-            check.setChecked(bool(builtin.get(key, True)))
+            check.setChecked(bool(builtin.get(key, False)))
         self._refresh_replacements_table()
 
     def _voice_prompt_changed(self, text: str) -> None:

@@ -346,33 +346,12 @@ std::string regexReplaceWithWarning(const std::string &input, const std::regex &
 }
 
 std::string summarizeUrlsForTts(const std::string &input, TtsTextSanitizeResult &result) {
-  static const std::regex urlRegex(
-      R"(\b((https?:\/\/|www\.)[^\s<>()\[\]{}\"']+|[A-Za-z0-9][A-Za-z0-9.-]{1,}\.(com|org|net|io|dev|mx|us|uk|ai|app|cloud|site|kg)(\/[^\s<>()\[\]{}\"']*)?))",
-      std::regex::icase);
-
-  std::string output;
-  std::sregex_iterator it(input.begin(), input.end(), urlRegex);
-  std::sregex_iterator end;
-  std::size_t cursor = 0;
-  for (; it != end; ++it) {
-    const auto &match = *it;
-    output.append(input.substr(cursor, static_cast<std::size_t>(match.position()) - cursor));
-    std::string url = match.str(1);
-    url = std::regex_replace(url, std::regex(R"(^https?:\/\/)", std::regex::icase), "");
-    url = std::regex_replace(url, std::regex(R"(^www\.)", std::regex::icase), "");
-    const auto stop = url.find_first_of("/?#");
-    std::string host = stop == std::string::npos ? url : url.substr(0, stop);
-    host = std::regex_replace(host, std::regex(R"(\.)"), " punto ");
-    output.append(" enlace a ");
-    output.append(host.empty() ? "sitio" : host);
-    output.push_back(' ');
-    cursor = static_cast<std::size_t>(match.position() + match.length());
-    ++result.urls;
-  }
-  if (cursor == 0) return input;
-  output.append(input.substr(cursor));
-  addTtsWarning(result, "URL_SUMMARIZED");
-  return output;
+  // La API ya no reescribe URLs ni dominios a texto tipo "enlace a ...".
+  // La pronunciacion de URLs, dominios y correos queda bajo control de
+  // neo.text_normalization de cada modelo. Esto evita falsos positivos como
+  // comandos: apt install docker.io.
+  (void)result;
+  return input;
 }
 
 std::string collapseRepeatedCodepoints(const std::string &input, std::size_t maxRun,
@@ -508,10 +487,11 @@ std::string sanitizeTtsTextForApi(const std::string &rawText, std::size_t maxCha
 
   text = summarizeUrlsForTts(text, result);
 
+  // No se reemplazan correos por "correo electronico" en la API.
+  // Si un modelo necesita leer correos como "arroba" y "punto", debe
+  // declararlo en neo.text_normalization.builtin.emails.
   static const std::regex emailRegex(R"(\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b)", std::regex::icase);
   if (std::regex_search(text, emailRegex)) {
-    text = std::regex_replace(text, emailRegex, " correo electronico ");
-    addTtsWarning(result, "EMAIL_SUMMARIZED");
     ++result.emails;
   }
 
@@ -557,7 +537,7 @@ std::string sanitizeTtsTextForApi(const std::string &rawText, std::size_t maxCha
       result.riskScore += 0.45;
     } else if (warning == "CODE_SUMMARIZED" || warning == "HIGH_ENTROPY_SPAN") {
       result.riskScore += 0.28;
-    } else if (warning == "INVISIBLE_REMOVED" || warning == "URL_SUMMARIZED") {
+    } else if (warning == "INVISIBLE_REMOVED") {
       result.riskScore += 0.14;
     } else {
       result.riskScore += 0.06;

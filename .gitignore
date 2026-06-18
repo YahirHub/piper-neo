@@ -54,3 +54,58 @@ etc/test_voice.onnx.json
 apps/neo-model-manager/.venv/
 apps/neo-model-manager/exports/
 apps/neo-model-manager/*.neo
+
+# Windows local builds / generated packages
+build-winlibs/
+dist-winlibs/
+build-msvc/
+dist-msvc/
+build-windows/
+dist-windows/
+build-winlibs-patch.cmake
+
+# CMake local/cache artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+_deps/
+Testing/
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+CMakeUserPresets.json
+
+# Ninja / Make local state
+.ninja_deps
+.ninja_log
+*.ninja
+Makefile.local
+
+# Native compiler outputs
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.def
+*.dSYM/
+
+# Python/tooling caches
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.cache/
+*.pyc
+*.pyo
+
+# Local generated patches/backups
+*.patch.local
+*.rej
+*.orig
+*.neo-backup

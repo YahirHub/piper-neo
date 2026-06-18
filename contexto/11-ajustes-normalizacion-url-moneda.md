@@ -35,3 +35,7 @@ El flujo de `normalizeTextForSpeech` ahora es:
 # Pendientes
 - Seguir ajustando reemplazos por modelo según pruebas auditivas reales.
 - Evaluar una opción futura para que el Model Manager pueda marcar reglas como "no aplicar dentro de URLs" si se agregan dominios sin protocolo.
+
+## Ajuste posterior: URLs controladas por modelo
+
+Se retiró el prefijo fijo `enlace` de la normalización de URLs del core. Además, el servidor dejó de resumir URLs y correos durante el sanitizado general. La lectura de URLs/correos ahora depende exclusivamente de `neo.text_normalization.builtin.urls` y `neo.text_normalization.builtin.emails` en cada modelo.

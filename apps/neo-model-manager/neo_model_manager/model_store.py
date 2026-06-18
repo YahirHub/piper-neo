@@ -216,12 +216,12 @@ def default_text_normalization(locale: str = "es-MX") -> dict[str, Any]:
         "enabled": True,
         "locale": locale,
         "builtin": {
-            "decimals": True,
-            "versions": True,
-            "percentages": True,
-            "currency": True,
-            "urls": True,
-            "emails": True,
+            "decimals": False,
+            "versions": False,
+            "percentages": False,
+            "currency": False,
+            "urls": False,
+            "emails": False,
         },
         "replacements": [],
     }

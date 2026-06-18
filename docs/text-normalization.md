@@ -29,12 +29,12 @@ La configuración vive dentro del JSON del modelo fuente o dentro del `metadata.
       "enabled": true,
       "locale": "es-MX",
       "builtin": {
-        "decimals": true,
-        "versions": true,
-        "percentages": true,
-        "currency": true,
-        "urls": true,
-        "emails": true
+        "decimals": false,
+        "versions": false,
+        "percentages": false,
+        "currency": false,
+        "urls": false,
+        "emails": false
       },
       "replacements": [
         {
@@ -64,7 +64,7 @@ Los reemplazos se ordenan por `priority` y después por longitud. Esto permite q
 
 ## Reglas inteligentes incluidas
 
-Piper Neo incluye normalización básica para español:
+Piper Neo incluye normalización básica para español, pero ninguna regla inteligente se activa por defecto. Cada modelo decide qué banderas habilitar en `neo.text_normalization.builtin`:
 
 ```txt
 3.5             → tres punto cinco
@@ -72,7 +72,7 @@ Piper Neo incluye normalización básica para español:
 $10.25         → 10 punto 25 pesos
 v1.0.3          → versión uno punto cero punto tres
 correo@x.com    → correo arroba x punto com
-https://x.com   → enlace x punto com
+https://x.com   → x punto com, solo si el modelo activa builtin.urls
 ```
 
 
@@ -98,15 +98,16 @@ Ese formato funciona, pero el recomendado es `neo.text_normalization.replacement
 - Usa `whole_word=true` casi siempre.
 - Usa `case_sensitive=false` para marcas como Facebook, YouTube o TikTok.
 - Usa prioridad alta para frases completas.
+- No actives `builtin.urls` si no quieres que el core toque enlaces. Si lo activas, se leerá el dominio sin prefijo fijo tipo "enlace a".
 - No edites `.neo` exportados; edita el `.onnx.json` fuente y exporta de nuevo.
 
 ## Protección de tokens normalizados
 
 Las reglas inteligentes generan texto protegido internamente antes de aplicar reemplazos personalizados. Esto evita que una marca dentro de un enlace se vuelva a reemplazar por accidente.
 
-Por ejemplo, si existe el reemplazo `GitHub → Guit Jab`, el texto `https://github.com` se normaliza como `enlace github punto com` y no como `enlace Guit Jab punto com`. Los reemplazos siguen funcionando fuera de enlaces y correos.
+Por ejemplo, si existe el reemplazo `GitHub → Guit Jab` y el modelo activa `builtin.urls`, el texto `https://github.com` se normaliza como `github punto com` y no como `Guit Jab punto com`. Los reemplazos siguen funcionando fuera de URLs y correos.
 
-También se recorta puntuación final común en URLs, para que `https://youtube.com.` no se lea con un `punto` extra del final de la oración.
+También se recorta puntuación final común en URLs cuando `builtin.urls` está activo, para que `https://youtube.com.` no se lea con un `punto` extra del final de la oración.
 
 ## Moneda con sufijo
 

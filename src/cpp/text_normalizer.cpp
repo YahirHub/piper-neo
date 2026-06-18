@@ -310,7 +310,7 @@ std::string urlToSpanish(const std::string &url) {
     value = value.substr(4);
   }
 
-  std::string out = "enlace ";
+  std::string out;
   for (char c : value) {
     if (c == '.') {
       out += " punto ";
@@ -566,14 +566,10 @@ void parseTextNormalizationConfig(const nlohmann::json &configRoot,
         config.enabled = tn.value("enabled", true);
         config.locale = tn.value("locale", config.locale);
 
-        // In the explicit Piper Neo schema, builtins default to enabled unless
-        // the JSON turns individual flags off.
-        config.builtin.decimals = true;
-        config.builtin.versions = true;
-        config.builtin.percentages = true;
-        config.builtin.currency = true;
-        config.builtin.urls = true;
-        config.builtin.emails = true;
+        // Piper Neo no aplica reglas inteligentes por defecto. Cada modelo
+        // debe declarar explicitamente que tipo de normalizacion quiere usar
+        // en neo.text_normalization.builtin. Esto evita que el core convierta
+        // URLs, dominios, moneda o porcentajes sin control del modelo.
         if (tn.contains("builtin")) {
           parseBuiltinFlags(tn["builtin"], config.builtin);
         }

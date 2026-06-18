@@ -72,3 +72,9 @@ No se agregaron librerías externas. Se usan utilidades estándar de C++17: `reg
 - Si solo existen `modelcard.replacements` legacy, se aplican reemplazos sin activar reglas inteligentes.
 - Se eliminó la mutación temporal de `voice.textNormalizationConfig.enabled` durante síntesis para evitar interferencias entre solicitudes concurrentes.
 - La recursión interna de pausas recibe `allowTextNormalization=false` en lugar de modificar el estado compartido de la voz.
+
+## Ajuste posterior: reglas inteligentes apagadas por defecto
+
+Se corrigió el comportamiento para que `neo.text_normalization` no active automáticamente todas las reglas inteligentes. Aunque exista la sección de normalización, cada bandera en `builtin` debe habilitarse de forma explícita por modelo.
+
+Esto evita que Piper Neo convierta URLs, correos, moneda o porcentajes sin que la configuración del modelo lo haya solicitado.

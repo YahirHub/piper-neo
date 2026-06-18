@@ -245,24 +245,33 @@ int piperMain(int argc, char *argv[]) {
                chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count());
 
   // Get the path to the piper executable so we can locate espeak-ng-data, etc.
-  // next to it.
-#ifdef _MSC_VER
+  // next to it. Windows must be detected with _WIN32 so MSVC and MinGW use
+  // the native path lookup instead of falling through to /proc/self/exe.
+#ifdef _WIN32
   auto exePath = []() {
     wchar_t moduleFileName[MAX_PATH] = {0};
-    GetModuleFileNameW(nullptr, moduleFileName, std::size(moduleFileName));
+    DWORD moduleFileNameSize = GetModuleFileNameW(
+        nullptr, moduleFileName, static_cast<DWORD>(std::size(moduleFileName)));
+
+    if (moduleFileNameSize == 0 ||
+        moduleFileNameSize >= static_cast<DWORD>(std::size(moduleFileName))) {
+      throw std::runtime_error(
+          "Unable to resolve Piper executable path on Windows");
+    }
+
     return filesystem::path(moduleFileName);
   }();
-#else
-#ifdef __APPLE__
+#elif defined(__APPLE__)
   auto exePath = []() {
     char moduleFileName[PATH_MAX] = {0};
     uint32_t moduleFileNameSize = std::size(moduleFileName);
     _NSGetExecutablePath(moduleFileName, &moduleFileNameSize);
     return filesystem::path(moduleFileName);
   }();
-#else
+#elif defined(__linux__)
   auto exePath = filesystem::canonical("/proc/self/exe");
-#endif
+#else
+  auto exePath = filesystem::absolute(argv[0]);
 #endif
 
   if (voice.phonemizeConfig.phonemeType == piper::eSpeakPhonemes) {
